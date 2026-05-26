@@ -54,11 +54,11 @@ model:
   image:
     perceiver_latents: 32
     perceiver_dim: 256
-    swin_freeze_layers: 1  # V3: 解冻 layer2，增强医学特征提取能力
+    swin_freeze_layers: 2  # V4: 回退冻结layer2，减少可训练参数
     swin_pretrained: true  # Set to true after placing model_swinvit.pt in pretrained/
 
   clinical:
-    n_prototypes: 8
+    n_prototypes: 4  # V4: 临床原型减半，防过拟合
     proto_dim: 128
     use_dataset_embedding: true
 
@@ -69,7 +69,7 @@ model:
     temporal_dropout: 0.1
 
   bottleneck:
-    n_slots: 8
+    n_slots: 4  # V4: 瓶颈槽位减半，砍分类头参数
     n_layers: 4
     dim: 256
     nhead: 8
@@ -78,7 +78,7 @@ model:
 
   classifier:
     hidden_dims: [256, 128]
-    dropout: 0.3
+    dropout: 0.5  # V4: 分类头加强dropout防过拟合
 
 # ---------------------------------------------------------------------------
 # 训练超参数
@@ -92,7 +92,7 @@ training:
   optimizer:
     name: "adamw"
     lr: 5.0e-5
-    weight_decay: 0.05
+    weight_decay: 0.1  # V4: 加强L2正则
     betas: [0.9, 0.999]
 
   scheduler:
@@ -116,7 +116,7 @@ training:
 # ---------------------------------------------------------------------------
 losses:
   focal:
-    alpha: 0.7
+    alpha: 0.85  # V4: 加强少数类学习
     gamma: 2.0
     weight: 1.0
 
