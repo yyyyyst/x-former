@@ -54,11 +54,11 @@ model:
   image:
     perceiver_latents: 32
     perceiver_dim: 256
-    swin_freeze_layers: 2  # V4: 回退冻结layer2，减少可训练参数
+    swin_freeze_layers: 2  # V5: 恢复V2架构
     swin_pretrained: true  # Set to true after placing model_swinvit.pt in pretrained/
 
   clinical:
-    n_prototypes: 4  # V4: 临床原型减半，防过拟合
+    n_prototypes: 8  # V5: 恢复V2容量
     proto_dim: 128
     use_dataset_embedding: true
 
@@ -69,7 +69,7 @@ model:
     temporal_dropout: 0.1
 
   bottleneck:
-    n_slots: 4  # V4: 瓶颈槽位减半，砍分类头参数
+    n_slots: 8  # V5: 恢复V2瓶颈容量
     n_layers: 4
     dim: 256
     nhead: 8
@@ -78,26 +78,26 @@ model:
 
   classifier:
     hidden_dims: [256, 128]
-    dropout: 0.5  # V4: 分类头加强dropout防过拟合
+    dropout: 0.3  # V5: 恢复V2水平
 
 # ---------------------------------------------------------------------------
 # 训练超参数
 # ---------------------------------------------------------------------------
 training:
   batch_size: 4
-  accumulation_steps: 12  # V3: 有效batch=48，减少小样本梯度噪声
+  accumulation_steps: 8  # V5: 恢复V2
   max_epochs: 150
   early_stop_patience: 35
 
   optimizer:
     name: "adamw"
     lr: 5.0e-5
-    weight_decay: 0.1  # V4: 加强L2正则
+    weight_decay: 0.05  # V5: 恢复V2
     betas: [0.9, 0.999]
 
   scheduler:
     name: "cosine_warm_restart"
-    T_0: 30  # V3: 拉长余弦周期，给模型更多时间收敛
+    T_0: 15  # V5: 恢复V2
     T_mult: 2
     eta_min: 1.0e-7
     warmup_epochs: 5
@@ -159,7 +159,7 @@ ablation:
   use_bottleneck: true
   use_perceiver: true
   use_domain_loss: true
-  use_contrastive_loss: true
+  use_contrastive_loss: false  # V5路线A: 关闭对比损失，纯净验证瓶颈融合
   use_consistency_loss: false  # 依赖病灶数据，与 use_lesion 同步
   use_lesion: false  # 病灶影像组学（第一篇未使用，先关闭，全脑为主）
   use_proto_clinical: true

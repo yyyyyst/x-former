@@ -139,18 +139,48 @@
 ## V4 — 缩模型 + 强正则
 
 **日期:** 2026-05-26
-**日志:** 待运行
+**日志:** `logs/xformer_20260526_161755.log` (提前终止)
 **思路:** 模型太大、数据太少，缩参数 + 防过拟合
 
 | 参数 | V3 | V4 | 原因 |
 |------|----|----|------|
-| bottleneck.n_slots | 8 | **4** | 分类头 2048→1024，砍 ~1M 参数 |
-| clinical.n_prototypes | 8 | **4** | 临床原型减半 |
-| swin_freeze_layers | 1 | **2** | 回退冻结 layer2 |
-| classifier.dropout | 0.3 | **0.5** | 分类头加强 dropout |
-| weight_decay | 0.05 | **0.1** | 翻倍 L2 正则 |
-| focal.alpha | 0.7 | **0.85** | 加强少数类关注 |
+| bottleneck.n_slots | 8 | 4 | 分类头 2048→1024 |
+| clinical.n_prototypes | 8 | 4 | 临床原型减半 |
+| swin_freeze_layers | 1 | 2 | 回退冻结 layer2 |
+| classifier.dropout | 0.3 | 0.5 | 分类头加强 dropout |
+| weight_decay | 0.05 | 0.1 | 翻倍 L2 正则 |
+| focal.alpha | 0.7 | 0.85 | 加强少数类关注 |
 
-其余同 V2：contrastive=0.03, domain=0.05, T_0=15, accum=8
+### Per-Fold 结果（仅 Fold 1，欠拟合提前终止）
 
-**预期:** 可训练参数 ~10M→~6M，77sets 过拟合减轻，Fold 间方差缩小，回到 0.75+。
+| Fold | Val AUC | 77sets Test AUC | ISLE Test AUC |
+|------|---------|-----------------|---------------|
+| 1 | 0.652 | — | — |
+
+### 分析
+
+- **欠拟合。** Best Val AUC 仅 0.652，21 轮未提升
+- 瓶颈 8→4 信息压缩过猛，有用信号也被挤掉
+- 结论：缩容量方向错误，V2 的 B=8 是合理下限
+
+---
+
+## V5 — 路线A: 关闭对比损失，纯净验证瓶颈融合
+
+**日期:** 2026-05-26
+**日志:** 待运行
+**思路:** 对比损失在 batch=4 小批次下可能是纯噪声，关掉后单测 focal+域对抗
+
+| 参数 | V4 | V5 | 原因 |
+|------|----|----|------|
+| use_contrastive_loss | true | **false** | 核心改动：消灭对比损失 |
+| n_slots | 4 | **8** | 回 V2 |
+| n_prototypes | 4 | **8** | 回 V2 |
+| classifier.dropout | 0.5 | **0.3** | 回 V2 |
+| weight_decay | 0.1 | **0.05** | 回 V2 |
+| T_0 | 30 | **15** | 回 V2 |
+| accum | 12 | **8** | 回 V2 |
+| focal.alpha | 0.85 | **0.85** | 保留，少数类关注有效 |
+| domain.weight | 0.05 | **0.05** | 保留 |
+
+**预期:** 如果 V5 追平 V2 (77sets≈0.75, ISLE≈0.80)，说明对比损失在 tiny batch 下无效。如果 V5 < V2，说明对比损失有贡献，路线A 被证伪。
