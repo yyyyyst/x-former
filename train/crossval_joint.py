@@ -1,0 +1,317 @@
+"""X-Former 5-fold cross-validation with joint training, DDP, TTA, and bootstrap CI."""
+import sys
+import os
+import json
+import warnings
+import argparse
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from data_provider.dataset_77sets import Dataset77sets
+from data_provider.dataset_isle2024 import DatasetISLE2024
+from data_provider.joint_sampler import JointDataset, InterleavedBatchSampler, joint_collate_fn
+from model.x_former import XFormer
+from train.trainer import Trainer
+from utils.bootstrap import bootstrap_ci
+from utils.metrics import compute_metrics, find_best_threshold
+from utils.plotting import plot_roc_curve, plot_confusion_matrix
+
+warnings.filterwarnings('ignore')
+
+
+def load_config(config_path: str) -> dict:
+    import yaml
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+@torch.no_grad()
+def evaluate_test_loader(model: nn.Module, loader: DataLoader, device: torch.device,
+                         tta: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Return y_true, y_prob for a test set, with optional TTA (horizontal flip)."""
+    model.eval()
+    probs_list, labels_list = [], []
+    for batch in loader:
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        logits = model(batch, return_domain=False)["logits"]
+        prob = torch.softmax(logits, dim=-1)[:, 1]
+
+        if tta:
+            batch_tta = {k: v.clone() if isinstance(v, torch.Tensor) else v
+                         for k, v in batch.items()}
+            batch_tta["image"] = torch.flip(batch_tta["image"], dims=[-1])
+            logits_tta = model(batch_tta, return_domain=False)["logits"]
+            prob_tta = torch.softmax(logits_tta, dim=-1)[:, 1]
+            prob = (prob + prob_tta) / 2.0
+
+        probs_list.append(prob.cpu().numpy())
+        labels_list.append(batch["label"].cpu().numpy())
+
+    return np.concatenate(labels_list), np.concatenate(probs_list)
+
+
+def run_fold(config: dict, fold: int, device: torch.device,
+             ds77_ref: Dataset77sets, ds_isle_ref: DatasetISLE2024) -> dict:
+    """Run a single fold: create splits, train, evaluate on both test sets."""
+    cv_cfg = config["crossval"]
+    train_cfg = config["training"]
+    ds_cfg = config["datasets"]
+    paths = config["paths"]
+    data_root = paths["data_root"]
+    batch_size = train_cfg["batch_size"]
+
+    labels77 = ds77_ref.labels
+    labels_isle = ds_isle_ref.labels
+    subjects77 = np.array(ds77_ref._subjects_order)
+    subjects_isle = np.array(ds_isle_ref._subjects_order)
+
+    # Create fold splits
+    skf77 = StratifiedKFold(n_splits=cv_cfg["n_folds"], shuffle=True, random_state=cv_cfg["seed"])
+    skf_isle = StratifiedKFold(n_splits=cv_cfg["n_folds"], shuffle=True, random_state=cv_cfg["seed"])
+
+    fold_idx77 = list(skf77.split(np.zeros(len(ds77_ref)), labels77))[fold]
+    fold_idx_isle = list(skf_isle.split(np.zeros(len(ds_isle_ref)), labels_isle))[fold]
+
+    train_idx77, test_idx77 = fold_idx77
+    sss77 = StratifiedShuffleSplit(n_splits=1, test_size=cv_cfg["test_size"],
+                                    random_state=cv_cfg["seed"])
+    train_sub77, val_sub77 = next(sss77.split(np.zeros(len(train_idx77)), labels77[train_idx77]))
+    train_subjects77 = subjects77[train_idx77][train_sub77]
+    val_subjects77 = subjects77[train_idx77][val_sub77]
+    test_subjects77 = subjects77[test_idx77]
+
+    train_idx_isle, test_idx_isle = fold_idx_isle
+    sss_isle = StratifiedShuffleSplit(n_splits=1, test_size=cv_cfg["test_size"],
+                                       random_state=cv_cfg["seed"])
+    train_sub_isle, val_sub_isle = next(sss_isle.split(np.zeros(len(train_idx_isle)),
+                                                        labels_isle[train_idx_isle]))
+    train_subjects_isle = subjects_isle[train_idx_isle][train_sub_isle]
+    val_subjects_isle = subjects_isle[train_idx_isle][val_sub_isle]
+    test_subjects_isle = subjects_isle[test_idx_isle]
+
+    # Per-fold train datasets (fit scalers on training data only - no leakage)
+    ds77_train = Dataset77sets(
+        clinical_path=os.path.join(data_root, ds_cfg["77sets"]["clinical_file"]),
+        image_dir=os.path.join(data_root, ds_cfg["77sets"]["image_dir"]),
+        radiomics_dir=os.path.join(data_root, ds_cfg["77sets"]["radiomics_dir"]),
+        subjects=train_subjects77, normalize=True, is_train=True,
+        target_shape=tuple(config["image"]["target_shape"]),
+    )
+    ds_isle_train = DatasetISLE2024(
+        clinical_path=os.path.join(data_root, ds_cfg["isle2024"]["clinical_file"]),
+        image_dir=os.path.join(data_root, ds_cfg["isle2024"]["image_dir"]),
+        radiomics_brain_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_brain_dir"]),
+        radiomics_lesion_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_lesion_dir"]),
+        subjects=train_subjects_isle, normalize=True, is_train=True,
+        target_shape=tuple(config["image"]["target_shape"]),
+    )
+
+    # Per-fold val/test datasets (use train-fitted scalers)
+    ds77_val = Dataset77sets(
+        clinical_path=os.path.join(data_root, ds_cfg["77sets"]["clinical_file"]),
+        image_dir=os.path.join(data_root, ds_cfg["77sets"]["image_dir"]),
+        radiomics_dir=os.path.join(data_root, ds_cfg["77sets"]["radiomics_dir"]),
+        subjects=val_subjects77, normalize=True, is_train=False,
+        clinical_scaler=ds77_train.clinical_scaler,
+        radiomics_scaler=ds77_train.radiomics_scaler,
+        target_shape=tuple(config["image"]["target_shape"]),
+    )
+    ds_isle_val = DatasetISLE2024(
+        clinical_path=os.path.join(data_root, ds_cfg["isle2024"]["clinical_file"]),
+        image_dir=os.path.join(data_root, ds_cfg["isle2024"]["image_dir"]),
+        radiomics_brain_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_brain_dir"]),
+        radiomics_lesion_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_lesion_dir"]),
+        subjects=val_subjects_isle, normalize=True, is_train=False,
+        clinical_scaler=ds_isle_train.clinical_scaler,
+        radiomics_scaler=ds_isle_train.radiomics_scaler,
+        target_shape=tuple(config["image"]["target_shape"]),
+    )
+
+    # Joint datasets for training
+    joint_train = JointDataset(ds77_train, ds_isle_train)
+    joint_val = JointDataset(ds77_val, ds_isle_val)
+
+    train_sampler = InterleavedBatchSampler(joint_train, batch_size_each=batch_size // 2)
+    train_loader = DataLoader(joint_train, batch_sampler=train_sampler,
+                              collate_fn=joint_collate_fn, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(joint_val, batch_size=batch_size, shuffle=False,
+                            collate_fn=joint_collate_fn, num_workers=2, pin_memory=True)
+
+    # Model
+    model = XFormer(config).to(device)
+    trainer = Trainer(model, config, device)
+    result = trainer.fit(train_loader, val_loader, fold=fold)
+    val_threshold = result.get("best_val_threshold", 0.5)
+    print(f"  Fold {fold + 1} best val AUC: {result['best_val_auc']:.4f} (thr: {val_threshold:.4f})")
+
+    # Test evaluation -- 77sets (use validation threshold, not test-optimized)
+    ds77_test = Dataset77sets(
+        clinical_path=os.path.join(data_root, ds_cfg["77sets"]["clinical_file"]),
+        image_dir=os.path.join(data_root, ds_cfg["77sets"]["image_dir"]),
+        radiomics_dir=os.path.join(data_root, ds_cfg["77sets"]["radiomics_dir"]),
+        subjects=test_subjects77, normalize=True, is_train=False,
+        clinical_scaler=ds77_train.clinical_scaler,
+        radiomics_scaler=ds77_train.radiomics_scaler,
+        target_shape=tuple(config["image"]["target_shape"]),
+    )
+    test_loader77 = DataLoader(ds77_test, batch_size=batch_size, shuffle=False, num_workers=2)
+    use_tta = config["eval"]["tta"]
+    y_true77, y_prob77 = evaluate_test_loader(model, test_loader77, device, tta=use_tta)
+    y_pred77 = (y_prob77 >= val_threshold).astype(int)
+    metrics77 = compute_metrics(y_true77, y_pred77, y_prob77)
+    metrics77["threshold"] = val_threshold
+    print(f"  77sets test AUC: {metrics77['auc']:.4f}")
+
+    # Test evaluation -- ISLE (use same validation threshold)
+    ds_isle_test = DatasetISLE2024(
+        clinical_path=os.path.join(data_root, ds_cfg["isle2024"]["clinical_file"]),
+        image_dir=os.path.join(data_root, ds_cfg["isle2024"]["image_dir"]),
+        radiomics_brain_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_brain_dir"]),
+        radiomics_lesion_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_lesion_dir"]),
+        subjects=test_subjects_isle, normalize=True, is_train=False,
+        clinical_scaler=ds_isle_train.clinical_scaler,
+        radiomics_scaler=ds_isle_train.radiomics_scaler,
+        target_shape=tuple(config["image"]["target_shape"]),
+    )
+    test_loader_isle = DataLoader(ds_isle_test, batch_size=batch_size, shuffle=False,
+                                   num_workers=2, collate_fn=joint_collate_fn)
+    y_true_isle, y_prob_isle = evaluate_test_loader(model, test_loader_isle, device, tta=use_tta)
+    y_pred_isle = (y_prob_isle >= val_threshold).astype(int)
+    metrics_isle = compute_metrics(y_true_isle, y_pred_isle, y_prob_isle)
+    metrics_isle["threshold"] = val_threshold
+    print(f"  ISLE test AUC: {metrics_isle['auc']:.4f}")
+
+    return {
+        "fold": fold,
+        "77sets": {"metrics": metrics77, "y_true": y_true77, "y_prob": y_prob77},
+        "ISLE2024": {"metrics": metrics_isle, "y_true": y_true_isle, "y_prob": y_prob_isle},
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="X-Former 5-fold CV")
+    parser.add_argument("--config", type=str, default="config/config.yaml")
+    parser.add_argument("--ddp", action="store_true")
+    args = parser.parse_args()
+
+    config_path = Path(__file__).resolve().parent.parent / args.config
+    config = load_config(str(config_path))
+    project_root = config_path.parent.parent  # config/ -> project root
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    cv_cfg = config["crossval"]
+    ds_cfg = config["datasets"]
+    paths = config["paths"]
+    # Resolve relative paths against project root
+    data_root = str(project_root / paths["data_root"])
+    results_root = str(project_root / paths["results_root"])
+
+    # Reference datasets (no normalization - used only for subject enumeration)
+    ds77_ref = Dataset77sets(
+        clinical_path=os.path.join(data_root, ds_cfg["77sets"]["clinical_file"]),
+        image_dir=os.path.join(data_root, ds_cfg["77sets"]["image_dir"]),
+        radiomics_dir=os.path.join(data_root, ds_cfg["77sets"]["radiomics_dir"]),
+        normalize=False,
+        target_shape=tuple(config["image"]["target_shape"]),
+    )
+    ds_isle_ref = DatasetISLE2024(
+        clinical_path=os.path.join(data_root, ds_cfg["isle2024"]["clinical_file"]),
+        image_dir=os.path.join(data_root, ds_cfg["isle2024"]["image_dir"]),
+        radiomics_brain_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_brain_dir"]),
+        radiomics_lesion_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_lesion_dir"]),
+        normalize=False,
+        target_shape=tuple(config["image"]["target_shape"]),
+    )
+
+    all_y_true: dict = {"77sets": [], "ISLE2024": []}
+    all_y_prob: dict = {"77sets": [], "ISLE2024": []}
+    all_results_77: list = []
+    all_results_isle: list = []
+    val_thresholds: list = []
+
+    for fold in range(cv_cfg["n_folds"]):
+        print(f"\n{'=' * 60}\nFold {fold + 1}/{cv_cfg['n_folds']}\n{'=' * 60}")
+        fold_result = run_fold(config, fold, device, ds77_ref, ds_isle_ref)
+        all_results_77.append(fold_result["77sets"]["metrics"])
+        all_results_isle.append(fold_result["ISLE2024"]["metrics"])
+        all_y_true["77sets"].append(fold_result["77sets"]["y_true"])
+        all_y_prob["77sets"].append(fold_result["77sets"]["y_prob"])
+        all_y_true["ISLE2024"].append(fold_result["ISLE2024"]["y_true"])
+        all_y_prob["ISLE2024"].append(fold_result["ISLE2024"]["y_prob"])
+        val_thresholds.append(fold_result["77sets"]["metrics"].get("threshold", 0.5))
+
+    # Aggregate results with bootstrap CI
+    print("\n" + "=" * 60)
+    print("FINAL RESULTS (95% CI, 1000 Bootstrap)")
+    print("=" * 60)
+
+    for ds_name, results_list in [("77sets", all_results_77), ("ISLE2024", all_results_isle)]:
+        print(f"\n{ds_name}:")
+        for metric in ["auc", "accuracy", "f1_macro", "precision", "recall"]:
+            vals = [r[metric] for r in results_list if metric in r]
+            if vals:
+                print(f"  {metric}: {np.mean(vals):.4f} +/- {np.std(vals):.4f}")
+
+    # Bootstrap CI on pooled predictions (use mean validation threshold)
+    results_dir = Path(results_root)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    pooled_threshold = float(np.mean(val_thresholds)) if val_thresholds else 0.5
+
+    for ds_name in all_y_true:
+        y_true_pooled = np.concatenate(all_y_true[ds_name])
+        y_prob_pooled = np.concatenate(all_y_prob[ds_name])
+
+        y_pred_pooled = (y_prob_pooled >= pooled_threshold).astype(int)
+
+        ci_results = bootstrap_ci(y_true_pooled, y_prob_pooled,
+                                  n_iter=config["eval"]["bootstrap_n"])
+        metrics = compute_metrics(y_true_pooled, y_pred_pooled, y_prob_pooled)
+
+        print(f"\n{ds_name} (pooled):")
+        for name, info in ci_results.items():
+            print(f"  {name}: {info['ci_str']}")
+
+        # Save metrics CSV
+        df = pd.DataFrame([{"dataset": ds_name, **metrics, "threshold": pooled_threshold}])
+        for name, info in ci_results.items():
+            df[f"{name}_ci_lower"] = info["ci_lower"]
+            df[f"{name}_ci_upper"] = info["ci_upper"]
+        csv_dir = results_dir / "joint"
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        df.to_csv(csv_dir / f"metrics_{ds_name}.csv", index=False)
+
+        # ROC curve
+        plot_roc_curve(y_true_pooled, y_prob_pooled,
+                       title=f"ROC Curve - {ds_name}",
+                       save_path=str(csv_dir / "roc_curves" / f"roc_{ds_name}.tif"))
+
+        # Confusion matrix
+        plot_confusion_matrix(y_true_pooled, y_pred_pooled,
+                              title=f"Confusion Matrix - {ds_name}",
+                              save_path=str(csv_dir / "confmat" / f"confmat_{ds_name}.tif"))
+
+    # Save fold results JSON
+    fold_summary = {
+        ds_name: [r for r in results_list]
+        for ds_name, results_list in [("77sets", all_results_77),
+                                       ("ISLE2024", all_results_isle)]
+    }
+    with open(csv_dir / "fold_results.json", 'w') as f:
+        json.dump(fold_summary, f, indent=2, default=str)
+
+    print(f"\nResults saved to {csv_dir}/")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,166 @@
+# =============================================================================
+# X-Former 统一配置文件
+# 跨模态信息瓶颈网络 — 第二篇论文
+# 所有超参数集中管理于此文件
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 路径配置 (相对于项目根目录)
+# ---------------------------------------------------------------------------
+paths:
+  data_root: "./datasets"
+  results_root: "./results"
+  pretrained_swin: "./pretrained/model_swinvit.pt"  # 从第一篇 model/ 复制，缺失则从头训练
+
+# ---------------------------------------------------------------------------
+# 数据集配置
+# ---------------------------------------------------------------------------
+datasets:
+  77sets:
+    name: "77sets"
+    modality: "MRI"
+    image_dir: "77sets/Image"
+    clinical_file: "77sets/Clinical/clinical.csv"
+    radiomics_dir: "77sets/Radiomics"
+    image_shape: [256, 256, 19]
+    radiomics_n_features: 16
+
+  isle2024:
+    name: "ISLE2024"
+    modality: "CT"
+    image_dir: "ISLE2024/Image_Brain"
+    image_lesion_dir: "ISLE2024/Image_Lesion"
+    clinical_file: "ISLE2024/Clinical/clinical_isle_2024_brain.csv"
+    radiomics_brain_dir: "ISLE2024/Radiomics_Brain"
+    radiomics_lesion_dir: "ISLE2024/Radiomics_Lesion"
+    image_shape: [512, 704, 84]
+    radiomics_n_features: 15
+    lesion_n_features: 6
+
+# ---------------------------------------------------------------------------
+# 图像预处理
+# ---------------------------------------------------------------------------
+image:
+  target_shape: [64, 160, 160]
+  multi_window:
+    - [40, 80]
+    - [80, 200]
+    - [40, 380]
+
+# ---------------------------------------------------------------------------
+# 模型超参数
+# ---------------------------------------------------------------------------
+model:
+  image:
+    perceiver_latents: 32
+    perceiver_dim: 256
+    swin_freeze_layers: 1  # V3: 解冻 layer2，增强医学特征提取能力
+    swin_pretrained: true  # Set to true after placing model_swinvit.pt in pretrained/
+
+  clinical:
+    n_prototypes: 8
+    proto_dim: 128
+    use_dataset_embedding: true
+
+  radiomics:
+    proj_dim: 128
+    temporal_nhead: 4
+    temporal_nlayers: 2
+    temporal_dropout: 0.1
+
+  bottleneck:
+    n_slots: 8
+    n_layers: 4
+    dim: 256
+    nhead: 8
+    dropout: 0.1
+    ff_expansion: 4
+
+  classifier:
+    hidden_dims: [256, 128]
+    dropout: 0.3
+
+# ---------------------------------------------------------------------------
+# 训练超参数
+# ---------------------------------------------------------------------------
+training:
+  batch_size: 4
+  accumulation_steps: 12  # V3: 有效batch=48，减少小样本梯度噪声
+  max_epochs: 150
+  early_stop_patience: 35
+
+  optimizer:
+    name: "adamw"
+    lr: 5.0e-5
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine_warm_restart"
+    T_0: 30  # V3: 拉长余弦周期，给模型更多时间收敛
+    T_mult: 2
+    eta_min: 1.0e-7
+    warmup_epochs: 5
+
+  mixed_precision: true
+  grad_clip_norm: 1.0
+
+  # 多卡训练 (DDP)
+  ddp:
+    enabled: false
+    backend: "nccl"
+    find_unused_parameters: false
+
+# ---------------------------------------------------------------------------
+# 损失权重
+# ---------------------------------------------------------------------------
+losses:
+  focal:
+    alpha: 0.7
+    gamma: 2.0
+    weight: 1.0
+
+  domain:
+    weight: 0.05
+    grl_lambda: 0.1
+
+  contrastive:
+    weight: 0.03
+    temperature: 0.1
+
+  consistency:
+    weight: 0.05
+
+# ---------------------------------------------------------------------------
+# 交叉验证
+# ---------------------------------------------------------------------------
+crossval:
+  n_folds: 5
+  test_size: 0.2
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# 评估
+# ---------------------------------------------------------------------------
+eval:
+  bootstrap_n: 1000
+  ci_alpha: 0.05
+  tta: true
+  threshold_search:
+    start: 0.1
+    end: 0.9
+    step: 0.01
+    metric: "f1_macro"
+
+# ---------------------------------------------------------------------------
+# 消融控制 (由 crossval_joint.py 读取控制模块开关)
+# ---------------------------------------------------------------------------
+ablation:
+  use_bottleneck: true
+  use_perceiver: true
+  use_domain_loss: true
+  use_contrastive_loss: true
+  use_consistency_loss: false  # 依赖病灶数据，与 use_lesion 同步
+  use_lesion: false  # 病灶影像组学（第一篇未使用，先关闭，全脑为主）
+  use_proto_clinical: true
+  joint_training: true
