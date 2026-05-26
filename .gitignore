@@ -5,3 +5,4 @@ __pycache__/
 .pt
 .pth
 .claude/
+pretrained/model_swinvit.pt
