@@ -158,7 +158,7 @@ eval:
 ablation:
   use_bottleneck: true
   use_perceiver: true
-  use_domain_loss: true
+  use_domain_loss: false  # V7: 瓶颈已天然跨模态对齐，域对抗有害
   use_contrastive_loss: true  # V6: 极轻量对比(weight=0.01)，帮助ISLE对齐
   use_consistency_loss: false  # 依赖病灶数据，与 use_lesion 同步
   use_lesion: false  # 病灶影像组学（第一篇未使用，先关闭，全脑为主）
