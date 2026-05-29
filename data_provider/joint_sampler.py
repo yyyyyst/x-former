@@ -6,21 +6,27 @@ from torch.utils.data import Dataset, Sampler
 
 
 class JointDataset(Dataset):
-    """Concatenated dataset with interleaved batch sampling."""
+    """Concatenated dataset with optional sample augmentation factor."""
 
-    def __init__(self, dataset_77: Dataset, dataset_isle: Dataset) -> None:
+    def __init__(self, dataset_77: Dataset, dataset_isle: Dataset,
+                 augment_77: int = 1, augment_isle: int = 1) -> None:
         self.ds77 = dataset_77
         self.dsisle = dataset_isle
         self.n77 = len(dataset_77)
         self.nisle = len(dataset_isle)
+        self.aug77 = augment_77
+        self.aug_isle = augment_isle
 
     def __len__(self) -> int:
-        return self.n77 + self.nisle
+        return self.n77 * self.aug77 + self.nisle * self.aug_isle
 
     def __getitem__(self, idx: int) -> dict:
-        if idx < self.n77:
-            return self.ds77[idx]
-        return self.dsisle[idx - self.n77]
+        n77_total = self.n77 * self.aug77
+        if idx < n77_total:
+            real_idx = idx % self.n77  # cycle through 77sets with different augmentation
+            return self.ds77[real_idx]
+        real_idx = (idx - n77_total) % self.nisle
+        return self.dsisle[real_idx]
 
 
 class InterleavedBatchSampler(Sampler):
@@ -32,16 +38,20 @@ class InterleavedBatchSampler(Sampler):
         batch_size_each: int = 4,
         shuffle: bool = True,
         seed: int = 42,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         self.n77 = joint_dataset.n77
         self.nisle = joint_dataset.nisle
         self.bs_each = batch_size_each
         self.shuffle = shuffle
-        self.rng = np.random.RandomState(seed)
+        self.rank = rank
+        self.world_size = world_size
+        self.rng = np.random.RandomState(seed + rank)  # different shuffle per GPU
         self.seed = seed
 
     def set_epoch(self, epoch: int) -> None:
-        self.rng = np.random.RandomState(self.seed + epoch)
+        self.rng = np.random.RandomState(self.seed + epoch + self.rank)
 
     def __iter__(self) -> Iterator[List[int]]:
         idx77 = np.arange(self.n77)
@@ -51,7 +61,11 @@ class InterleavedBatchSampler(Sampler):
             self.rng.shuffle(idxisle)
 
         n_batches = min(len(idx77) // self.bs_each, len(idxisle) // self.bs_each)
-        for b in range(n_batches):
+        # DDP: each GPU gets its share of batches
+        batches_per_gpu = n_batches // self.world_size
+        start = self.rank * batches_per_gpu
+        end = start + batches_per_gpu if self.rank < self.world_size - 1 else n_batches
+        for b in range(start, end):
             batch: List[int] = []
             for i in range(self.bs_each):
                 batch.append(int(idx77[b * self.bs_each + i]))
@@ -59,7 +73,11 @@ class InterleavedBatchSampler(Sampler):
             yield batch
 
     def __len__(self) -> int:
-        return min(self.n77 // self.bs_each, self.nisle // self.bs_each)
+        total = min(self.n77 // self.bs_each, self.nisle // self.bs_each)
+        batches_per_gpu = total // self.world_size
+        if self.rank < self.world_size - 1:
+            return batches_per_gpu
+        return total - batches_per_gpu * (self.world_size - 1)
 
 
 def joint_collate_fn(batch: List[dict]) -> dict:

@@ -12,7 +12,7 @@ from sklearn.preprocessing import StandardScaler
 from monai.transforms import (
     Compose, RandRotate90, RandFlip, RandAffine,
     RandGaussianNoise, RandAdjustContrast, RandCoarseDropout,
-    RandShiftIntensity, CropForeground, RandBiasField,
+    RandShiftIntensity, CropForeground,
 )
 
 pd.set_option('future.no_silent_downcasting', True)
@@ -125,7 +125,6 @@ class Dataset77sets(Dataset):
                 RandShiftIntensity(offsets=0.1, prob=0.5),
                 RandGaussianNoise(prob=0.3, std=0.05),
                 RandAdjustContrast(prob=0.3, gamma=(0.7, 1.3)),
-                RandBiasField(prob=0.3, degree=3, coeff_range=(0.0, 0.3)),
                 RandCoarseDropout(holes=2, spatial_size=(16, 16, 16),
                                   fill_value=0, prob=0.3),
             ])
@@ -149,16 +148,16 @@ class Dataset77sets(Dataset):
         image_np = np.nan_to_num(nii_img.get_fdata())
         image_tensor = torch.tensor(image_np, dtype=torch.float32).permute(2, 0, 1)
 
-        # MRI-specific z-score window: preserves full tissue contrast
-        def zscore_window(img, lower=-3.0, upper=3.0):
-            mean, std = img.mean(), img.std()
-            img_n = (img - mean) / (std + 1e-8)
-            return (img_n.clamp(lower, upper) + upper) / (upper - lower)
+        # CT-style window: consistent with Paper 1
+        def get_window(img, center, width):
+            lower, upper = center - width // 2, center + width // 2
+            img_w = torch.clamp(img, min=lower, max=upper)
+            return (img_w - lower) / (upper - lower)
 
         image = torch.stack([
-            zscore_window(image_tensor, -3.0, 3.0),   # standard full brain
-            zscore_window(image_tensor, -1.5, 1.5),   # subtle contrast
-            zscore_window(image_tensor, -5.0, 5.0),   # outlier capture
+            get_window(image_tensor, 40, 80),
+            get_window(image_tensor, 80, 200),
+            get_window(image_tensor, 40, 380),
         ], dim=0)
         image = self.cropper(image)
         image = F.interpolate(image.unsqueeze(0), size=self.target_shape,

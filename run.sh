@@ -64,7 +64,7 @@ LOG_FILE="${LOG_DIR}/${RUN_NAME}.log"
 
 if $USE_DDP; then
     N_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
-    CMD="CUDA_VISIBLE_DEVICES=$GPU_IDS python3 -u train/crossval_joint.py --config $CONFIG --ddp"
+    CMD="CUDA_VISIBLE_DEVICES=$GPU_IDS torchrun --nproc_per_node=$N_GPUS train/crossval_joint.py --config $CONFIG"
 else
     CMD="CUDA_VISIBLE_DEVICES=$GPU_IDS python3 -u train/crossval_joint.py --config $CONFIG"
 fi

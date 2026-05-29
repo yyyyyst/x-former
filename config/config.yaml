@@ -84,8 +84,8 @@ model:
 # 训练超参数
 # ---------------------------------------------------------------------------
 training:
-  batch_size: 8  # V6: 加速一倍
-  accumulation_steps: 8  # V5: 恢复V2
+  batch_size: 6  # V6: 加速一倍
+  accumulation_steps: 4  # V8 DDP: 3卡×8batch×4accum=96有效batch  # V5: 恢复V2
   max_epochs: 150
   early_stop_patience: 35
 
@@ -121,11 +121,11 @@ losses:
     weight: 1.0
 
   domain:
-    weight: 0.03  # V6: 降低域对抗，让瓶颈专注分类
+    weight: 0.05  # V8: 回V2水平，ISLE需要域对抗对齐CT特征
     grl_lambda: 0.1
 
   contrastive:
-    weight: 0.01  # V6: 极轻量对比，帮助ISLE但不伤害77sets
+    weight: 0.02  # V8: 介于V2(0.03)和V5(0)之间，平衡77sets/ISLE
     temperature: 0.1
 
   consistency:
@@ -158,8 +158,8 @@ eval:
 ablation:
   use_bottleneck: true
   use_perceiver: true
-  use_domain_loss: false  # V7: 瓶颈已天然跨模态对齐，域对抗有害
-  use_contrastive_loss: true  # V6: 极轻量对比(weight=0.01)，帮助ISLE对齐
+  use_domain_loss: false  # V9: 关域对抗→随机采样→ISLE数据100%利用
+  use_contrastive_loss: false  # V9: V5验证最优，关对比损失
   use_consistency_loss: false  # 依赖病灶数据，与 use_lesion 同步
   use_lesion: false  # 病灶影像组学（第一篇未使用，先关闭，全脑为主）
   use_proto_clinical: true

@@ -15,8 +15,10 @@ from utils.metrics import compute_metrics, find_best_threshold
 
 class Trainer:
     def __init__(self, model: nn.Module, config: Dict[str, Any],
-                 device: torch.device) -> None:
+                 device: torch.device, rank: int = 0) -> None:
         self.model = model
+        self._raw_model = model.module if hasattr(model, 'module') else model
+        self.rank = rank
         self.config = config
         self.device = device
         loss_cfg = config["losses"]
@@ -210,33 +212,35 @@ class Trainer:
             val_metrics = self.validate(val_loader)
             val_auc = val_metrics["auc"]
 
-            # Print per-epoch summary
-            lr = self.optimizer.param_groups[0]['lr']
-            print(f"Epoch {epoch + 1:3d}/{self.max_epochs} | "
-                  f"LR: {lr:.2e} | "
-                  f"Loss: {train_metrics['loss']:.4f} "
-                  f"(F:{train_metrics['focal_loss']:.4f} "
-                  f"D:{train_metrics['domain_loss']:.4f} "
-                  f"C:{train_metrics['contrast_loss']:.4f} "
-                  f"K:{train_metrics['consist_loss']:.4f}) | "
-                  f"Val AUC: {val_auc:.4f} "
-                  f"Acc: {val_metrics['accuracy']:.4f} "
-                  f"F1: {val_metrics['f1_macro']:.4f}"
-                  + (" *" if val_auc > best_val_auc else f"  ({patience_counter + 1}/{self.early_stop_patience})"))
+            # Print per-epoch summary (rank 0 only)
+            if self.rank == 0:
+                lr = self.optimizer.param_groups[0]['lr']
+                print(f"Epoch {epoch + 1:3d}/{self.max_epochs} | "
+                      f"LR: {lr:.2e} | "
+                      f"Loss: {train_metrics['loss']:.4f} "
+                      f"(F:{train_metrics['focal_loss']:.4f} "
+                      f"D:{train_metrics['domain_loss']:.4f} "
+                      f"C:{train_metrics['contrast_loss']:.4f} "
+                      f"K:{train_metrics['consist_loss']:.4f}) | "
+                      f"Val AUC: {val_auc:.4f} "
+                      f"Acc: {val_metrics['accuracy']:.4f} "
+                      f"F1: {val_metrics['f1_macro']:.4f}"
+                      + (" *" if val_auc > best_val_auc else f"  ({patience_counter + 1}/{self.early_stop_patience})"))
 
             if val_auc > best_val_auc:
                 best_val_auc = val_auc
                 best_val_threshold = val_metrics.get("threshold", 0.5)
-                best_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+                best_state = {k: v.clone() for k, v in self._raw_model.state_dict().items()}
                 patience_counter = 0
             else:
                 patience_counter += 1
 
             if patience_counter >= self.early_stop_patience:
-                print(f"  Early stop at epoch {epoch + 1}, best AUC: {best_val_auc:.4f}")
+                if self.rank == 0:
+                    print(f"  Early stop at epoch {epoch + 1}, best AUC: {best_val_auc:.4f}")
                 break
 
         if best_state is not None:
-            self.model.load_state_dict(best_state)
+            self._raw_model.load_state_dict(best_state)
         return {"best_val_auc": best_val_auc, "best_val_threshold": best_val_threshold,
                 "epoch": epoch + 1}

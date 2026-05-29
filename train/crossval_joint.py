@@ -27,6 +27,22 @@ from utils.plotting import plot_roc_curve, plot_confusion_matrix
 warnings.filterwarnings('ignore')
 
 
+def setup_ddp() -> tuple[int, int]:
+    """Initialize DDP from torchrun env vars. Returns (rank, world_size)."""
+    if "LOCAL_RANK" not in os.environ:
+        return 0, 1
+    rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(rank)
+    return rank, world_size
+
+
+def cleanup_ddp() -> None:
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def load_config(config_path: str) -> dict:
     import yaml
     with open(config_path) as f:
@@ -60,7 +76,8 @@ def evaluate_test_loader(model: nn.Module, loader: DataLoader, device: torch.dev
 
 
 def run_fold(config: dict, fold: int, device: torch.device,
-             ds77_ref: Dataset77sets, ds_isle_ref: DatasetISLE2024) -> dict:
+             ds77_ref: Dataset77sets, ds_isle_ref: DatasetISLE2024,
+             rank: int = 0, world_size: int = 1) -> dict:
     """Run a single fold: create splits, train, evaluate on both test sets."""
     cv_cfg = config["crossval"]
     train_cfg = config["training"]
@@ -137,18 +154,40 @@ def run_fold(config: dict, fold: int, device: torch.device,
     )
 
     # Joint datasets for training
-    joint_train = JointDataset(ds77_train, ds_isle_train)
+    # V9: off-line oversampling — 77sets ×4, ISLE ×2 (only training set)
+    joint_train = JointDataset(ds77_train, ds_isle_train, augment_77=4, augment_isle=2)
     joint_val = JointDataset(ds77_val, ds_isle_val)
 
-    train_sampler = InterleavedBatchSampler(joint_train, batch_size_each=batch_size // 2)
-    train_loader = DataLoader(joint_train, batch_sampler=train_sampler,
-                              collate_fn=joint_collate_fn, num_workers=2, pin_memory=True)
+    use_interleaved = config["ablation"].get("use_domain_loss", True)
+    if use_interleaved:
+        from data_provider.joint_sampler import InterleavedBatchSampler
+        train_sampler = InterleavedBatchSampler(joint_train, batch_size_each=batch_size // 2,
+                                                  rank=rank, world_size=world_size)
+        train_loader = DataLoader(joint_train, batch_sampler=train_sampler,
+                                  collate_fn=joint_collate_fn, num_workers=2, pin_memory=True)
+    else:
+        # V9: random shuffle — DistributedSampler for DDP, RandomSampler for single GPU
+        if world_size > 1:
+            from torch.utils.data import DistributedSampler
+            sampler = DistributedSampler(joint_train, shuffle=True,
+                                          num_replicas=world_size, rank=rank)
+        else:
+            from torch.utils.data import RandomSampler
+            sampler = RandomSampler(joint_train, replacement=False)
+        train_loader = DataLoader(joint_train, batch_size=batch_size, sampler=sampler,
+                                  collate_fn=joint_collate_fn, num_workers=2, pin_memory=True)
     val_loader = DataLoader(joint_val, batch_size=batch_size, shuffle=False,
                             collate_fn=joint_collate_fn, num_workers=2, pin_memory=True)
 
-    # Model
+    # Model — sync all GPUs before creating/switching models
+    if world_size > 1:
+        dist.barrier()
     model = XFormer(config).to(device)
-    trainer = Trainer(model, config, device)
+    if world_size > 1:
+        dist.barrier()
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[device.index],
+                                                      find_unused_parameters=True)
+    trainer = Trainer(model, config, device, rank=rank)
     result = trainer.fit(train_loader, val_loader, fold=fold)
     val_threshold = result.get("best_val_threshold", 0.5)
     print(f"  Fold {fold + 1} best val AUC: {result['best_val_auc']:.4f} (thr: {val_threshold:.4f})")
@@ -169,7 +208,6 @@ def run_fold(config: dict, fold: int, device: torch.device,
     y_pred77 = (y_prob77 >= val_threshold).astype(int)
     metrics77 = compute_metrics(y_true77, y_pred77, y_prob77)
     metrics77["threshold"] = val_threshold
-    print(f"  77sets test AUC: {metrics77['auc']:.4f}")
 
     # Test evaluation -- ISLE (use same validation threshold)
     ds_isle_test = DatasetISLE2024(
@@ -188,7 +226,11 @@ def run_fold(config: dict, fold: int, device: torch.device,
     y_pred_isle = (y_prob_isle >= val_threshold).astype(int)
     metrics_isle = compute_metrics(y_true_isle, y_pred_isle, y_prob_isle)
     metrics_isle["threshold"] = val_threshold
-    print(f"  ISLE test AUC: {metrics_isle['auc']:.4f}")
+    if rank == 0:
+        print(f"  77sets test AUC: {metrics77['auc']:.4f}")
+        print(f"  ISLE test AUC: {metrics_isle['auc']:.4f}")
+    if world_size > 1:
+        dist.barrier()
 
     return {
         "fold": fold,
@@ -200,15 +242,17 @@ def run_fold(config: dict, fold: int, device: torch.device,
 def main() -> None:
     parser = argparse.ArgumentParser(description="X-Former 5-fold CV")
     parser.add_argument("--config", type=str, default="config/config.yaml")
-    parser.add_argument("--ddp", action="store_true")
     args = parser.parse_args()
+
+    rank, world_size = setup_ddp()
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
 
     config_path = Path(__file__).resolve().parent.parent / args.config
     config = load_config(str(config_path))
     project_root = config_path.parent.parent  # config/ -> project root
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    if rank == 0:
+        print(f"Device: {device}, World size: {world_size}")
 
     cv_cfg = config["crossval"]
     ds_cfg = config["datasets"]
@@ -241,8 +285,10 @@ def main() -> None:
     val_thresholds: list = []
 
     for fold in range(cv_cfg["n_folds"]):
-        print(f"\n{'=' * 60}\nFold {fold + 1}/{cv_cfg['n_folds']}\n{'=' * 60}")
-        fold_result = run_fold(config, fold, device, ds77_ref, ds_isle_ref)
+        if rank == 0:
+            print(f"\n{'=' * 60}\nFold {fold + 1}/{cv_cfg['n_folds']}\n{'=' * 60}")
+        fold_result = run_fold(config, fold, device, ds77_ref, ds_isle_ref,
+                               rank=rank, world_size=world_size)
         all_results_77.append(fold_result["77sets"]["metrics"])
         all_results_isle.append(fold_result["ISLE2024"]["metrics"])
         all_y_true["77sets"].append(fold_result["77sets"]["y_true"])
@@ -251,7 +297,11 @@ def main() -> None:
         all_y_prob["ISLE2024"].append(fold_result["ISLE2024"]["y_prob"])
         val_thresholds.append(fold_result["77sets"]["metrics"].get("threshold", 0.5))
 
-    # Aggregate results with bootstrap CI
+    if rank != 0:
+        cleanup_ddp()
+        return
+
+    # Aggregate results with bootstrap CI (rank 0 only)
     print("\n" + "=" * 60)
     print("FINAL RESULTS (95% CI, 1000 Bootstrap)")
     print("=" * 60)
@@ -309,6 +359,20 @@ def main() -> None:
     }
     with open(csv_dir / "fold_results.json", 'w') as f:
         json.dump(fold_summary, f, indent=2, default=str)
+
+    # Cross-modal alignment score (V9)
+    # The modality gap = |77sets AUC - ISLE AUC| per fold
+    # Small gap → bottleneck treats both modalities equally → cross-modal alignment
+    print("\n" + "=" * 60)
+    print("CROSS-MODAL ALIGNMENT")
+    print("=" * 60)
+    gaps = []
+    for i in range(len(all_results_77)):
+        gap = abs(all_results_77[i]["auc"] - all_results_isle[i]["auc"])
+        gaps.append(gap)
+        print(f"  Fold {i + 1}: |77sets AUC - ISLE AUC| = {gap:.4f}")
+    print(f"  Mean modality gap: {np.mean(gaps):.4f} ± {np.std(gaps):.4f}")
+    print(f"  (small gap = bottleneck treats MRI/CT equally = cross-modal aligned)")
 
     print(f"\nResults saved to {csv_dir}/")
 
