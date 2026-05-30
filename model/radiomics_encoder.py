@@ -8,11 +8,11 @@ class RadiomicsEncoder(nn.Module):
 
     - Per-sample dataset-specific linear projectors (handles mixed batches).
     - Shared temporal Transformer learns perfusion dynamics across datasets.
-    - Separate lesion branch handles static shape features (ISLE only).
+    - Optional lesion branch handles static shape features (disabled by default).
     """
 
     def __init__(self, proj_dim: int = 128, nhead: int = 4, nlayers: int = 2,
-                 dropout: float = 0.1, use_lesion: bool = True) -> None:
+                 dropout: float = 0.1, use_lesion: bool = False) -> None:
         super().__init__()
         self.use_lesion = use_lesion
         self.proj_77sets = nn.Linear(16, proj_dim)

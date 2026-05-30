@@ -47,37 +47,145 @@ class InterleavedBatchSampler(Sampler):
         self.shuffle = shuffle
         self.rank = rank
         self.world_size = world_size
-        self.rng = np.random.RandomState(seed + rank)  # different shuffle per GPU
+        self.offset_isle = joint_dataset.n77 * joint_dataset.aug77
+        self.rng = np.random.RandomState(seed)
         self.seed = seed
 
     def set_epoch(self, epoch: int) -> None:
-        self.rng = np.random.RandomState(self.seed + epoch + self.rank)
+        self.rng = np.random.RandomState(self.seed + epoch)
 
     def __iter__(self) -> Iterator[List[int]]:
         idx77 = np.arange(self.n77)
-        idxisle = np.arange(self.n77, self.n77 + self.nisle)
+        idxisle = np.arange(self.offset_isle, self.offset_isle + self.nisle)
         if self.shuffle:
             self.rng.shuffle(idx77)
             self.rng.shuffle(idxisle)
 
         n_batches = min(len(idx77) // self.bs_each, len(idxisle) // self.bs_each)
-        # DDP: each GPU gets its share of batches
-        batches_per_gpu = n_batches // self.world_size
-        start = self.rank * batches_per_gpu
-        end = start + batches_per_gpu if self.rank < self.world_size - 1 else n_batches
-        for b in range(start, end):
+        batches: List[List[int]] = []
+        for b in range(n_batches):
             batch: List[int] = []
             for i in range(self.bs_each):
                 batch.append(int(idx77[b * self.bs_each + i]))
                 batch.append(int(idxisle[b * self.bs_each + i]))
+            batches.append(batch)
+
+        while batches and len(batches) % self.world_size != 0:
+            batches.append(list(batches[self.rng.randint(0, len(batches))]))
+
+        for batch in batches[self.rank::self.world_size]:
             yield batch
 
     def __len__(self) -> int:
         total = min(self.n77 // self.bs_each, self.nisle // self.bs_each)
-        batches_per_gpu = total // self.world_size
-        if self.rank < self.world_size - 1:
-            return batches_per_gpu
-        return total - batches_per_gpu * (self.world_size - 1)
+        if self.world_size <= 1:
+            return total
+        return int(np.ceil(total / self.world_size))
+
+
+class BalancedFullSampler(Sampler):
+    """Use all ISLE samples once per epoch and sample 77sets to match.
+
+    This keeps ISLE data utilization high without duplicating the underlying
+    JointDataset length. In DDP, the batch list is padded so every rank gets the
+    same number of steps.
+    """
+
+    def __init__(
+        self,
+        joint_dataset: JointDataset,
+        batch_size: int = 4,
+        replacement_77: bool = True,
+        replacement_isle: bool = False,
+        balance_77_classes: bool = True,
+        shuffle: bool = True,
+        seed: int = 42,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        if batch_size < 2:
+            raise ValueError("BalancedFullSampler requires batch_size >= 2")
+        self.joint_dataset = joint_dataset
+        self.n77 = joint_dataset.n77
+        self.nisle = joint_dataset.nisle
+        self.bs77 = max(1, batch_size // 2)
+        self.bsisle = max(1, batch_size - self.bs77)
+        self.replacement_77 = replacement_77
+        self.replacement_isle = replacement_isle
+        self.balance_77_classes = balance_77_classes
+        self.shuffle = shuffle
+        self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
+        self.offset_isle = joint_dataset.n77 * joint_dataset.aug77
+        self.rng = np.random.RandomState(seed)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.rng = np.random.RandomState(self.seed + epoch)
+
+    def _sample_77(self, n: int) -> np.ndarray:
+        idx77 = np.arange(self.n77)
+        replace = self.replacement_77 or n > self.n77
+        probs = None
+        labels = getattr(self.joint_dataset.ds77, "labels", None)
+        if self.balance_77_classes and labels is not None:
+            labels_arr = np.asarray(labels)
+            classes, counts = np.unique(labels_arr, return_counts=True)
+            class_weights = {cls: 1.0 / count for cls, count in zip(classes, counts)}
+            weights = np.array([class_weights[label] for label in labels_arr], dtype=np.float64)
+            probs = weights / weights.sum()
+        if replace:
+            return self.rng.choice(idx77, size=n, replace=True, p=probs)
+        if self.shuffle:
+            self.rng.shuffle(idx77)
+        return idx77[:n]
+
+    def _sample_isle(self, n_total: int) -> np.ndarray:
+        idxisle = np.arange(self.offset_isle, self.offset_isle + self.nisle)
+        if self.shuffle:
+            self.rng.shuffle(idxisle)
+        if n_total <= self.nisle:
+            return idxisle[:n_total]
+        n_extra = n_total - self.nisle
+        extra = self.rng.choice(idxisle, size=n_extra, replace=True)
+        return np.concatenate([idxisle, extra])
+
+    def _num_batches(self) -> int:
+        return int(np.ceil(self.nisle / self.bsisle))
+
+    def _padded_num_batches(self) -> int:
+        n_batches = self._num_batches()
+        if self.world_size <= 1:
+            return n_batches
+        return int(np.ceil(n_batches / self.world_size) * self.world_size)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        n_batches = self._num_batches()
+        n_batches_padded = self._padded_num_batches()
+        n_isle_needed = n_batches * self.bsisle
+        n77_needed = n_batches * self.bs77
+
+        idx77 = self._sample_77(n77_needed)
+        idxisle = self._sample_isle(n_isle_needed)
+
+        batches: List[List[int]] = []
+        for b in range(n_batches):
+            start77, end77 = b * self.bs77, (b + 1) * self.bs77
+            start_isle, end_isle = b * self.bsisle, (b + 1) * self.bsisle
+            batch = [int(i) for i in idx77[start77:end77]]
+            batch.extend(int(i) for i in idxisle[start_isle:end_isle])
+            if self.shuffle:
+                self.rng.shuffle(batch)
+            batches.append(batch)
+
+        while len(batches) < n_batches_padded:
+            batches.append(list(batches[self.rng.randint(0, len(batches))]))
+
+        for batch in batches[self.rank::self.world_size]:
+            yield batch
+
+    def __len__(self) -> int:
+        return self._padded_num_batches() // self.world_size
 
 
 def joint_collate_fn(batch: List[dict]) -> dict:

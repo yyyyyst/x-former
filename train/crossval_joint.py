@@ -17,11 +17,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data_provider.dataset_77sets import Dataset77sets
 from data_provider.dataset_isle2024 import DatasetISLE2024
-from data_provider.joint_sampler import JointDataset, InterleavedBatchSampler, joint_collate_fn
+from data_provider.joint_sampler import (
+    BalancedFullSampler,
+    InterleavedBatchSampler,
+    JointDataset,
+    joint_collate_fn,
+)
 from model.x_former import XFormer
 from train.trainer import Trainer
 from utils.bootstrap import bootstrap_ci
-from utils.metrics import compute_metrics, find_best_threshold
+from utils.metrics import compute_metrics
 from utils.plotting import plot_roc_curve, plot_confusion_matrix
 
 warnings.filterwarnings('ignore')
@@ -49,12 +54,43 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def resolve_isle_lesion_dir(config: dict, data_root: str) -> str | None:
+    """Only expose lesion radiomics when the experiment explicitly enables it."""
+    if not config.get("ablation", {}).get("use_lesion", False):
+        return None
+    lesion_dir = config["datasets"]["isle2024"].get("radiomics_lesion_dir")
+    return os.path.join(data_root, lesion_dir) if lesion_dir else None
+
+
+def prediction_rows(
+    fold: int,
+    dataset: str,
+    subjects: list[str],
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    threshold: float,
+) -> list[dict]:
+    y_pred = (y_prob >= threshold).astype(int)
+    return [
+        {
+            "fold": fold + 1,
+            "dataset": dataset,
+            "subject": subject,
+            "y_true": int(label),
+            "y_prob": float(prob),
+            "threshold": float(threshold),
+            "y_pred": int(pred),
+        }
+        for subject, label, prob, pred in zip(subjects, y_true, y_prob, y_pred)
+    ]
+
+
 @torch.no_grad()
 def evaluate_test_loader(model: nn.Module, loader: DataLoader, device: torch.device,
-                         tta: bool = False) -> tuple[np.ndarray, np.ndarray]:
-    """Return y_true, y_prob for a test set, with optional TTA (horizontal flip)."""
+                         tta: bool = False) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Return y_true, y_prob, subjects for a test set, with optional TTA."""
     model.eval()
-    probs_list, labels_list = [], []
+    probs_list, labels_list, subjects_list = [], [], []
     for batch in loader:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
@@ -71,8 +107,15 @@ def evaluate_test_loader(model: nn.Module, loader: DataLoader, device: torch.dev
 
         probs_list.append(prob.cpu().numpy())
         labels_list.append(batch["label"].cpu().numpy())
+        subjects = batch.get("subject")
+        if subjects is None:
+            subjects_list.extend([""] * len(prob))
+        elif isinstance(subjects, str):
+            subjects_list.append(subjects)
+        else:
+            subjects_list.extend([str(s) for s in subjects])
 
-    return np.concatenate(labels_list), np.concatenate(probs_list)
+    return np.concatenate(labels_list), np.concatenate(probs_list), subjects_list
 
 
 def run_fold(config: dict, fold: int, device: torch.device,
@@ -85,6 +128,8 @@ def run_fold(config: dict, fold: int, device: torch.device,
     paths = config["paths"]
     data_root = paths["data_root"]
     batch_size = train_cfg["batch_size"]
+    sampling_cfg = config.get("sampling", {})
+    lesion_dir = resolve_isle_lesion_dir(config, data_root)
 
     labels77 = ds77_ref.labels
     labels_isle = ds_isle_ref.labels
@@ -127,7 +172,7 @@ def run_fold(config: dict, fold: int, device: torch.device,
         clinical_path=os.path.join(data_root, ds_cfg["isle2024"]["clinical_file"]),
         image_dir=os.path.join(data_root, ds_cfg["isle2024"]["image_dir"]),
         radiomics_brain_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_brain_dir"]),
-        radiomics_lesion_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_lesion_dir"]),
+        radiomics_lesion_dir=lesion_dir,
         subjects=train_subjects_isle, normalize=True, is_train=True,
         target_shape=tuple(config["image"]["target_shape"]),
     )
@@ -146,7 +191,7 @@ def run_fold(config: dict, fold: int, device: torch.device,
         clinical_path=os.path.join(data_root, ds_cfg["isle2024"]["clinical_file"]),
         image_dir=os.path.join(data_root, ds_cfg["isle2024"]["image_dir"]),
         radiomics_brain_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_brain_dir"]),
-        radiomics_lesion_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_lesion_dir"]),
+        radiomics_lesion_dir=lesion_dir,
         subjects=val_subjects_isle, normalize=True, is_train=False,
         clinical_scaler=ds_isle_train.clinical_scaler,
         radiomics_scaler=ds_isle_train.radiomics_scaler,
@@ -154,19 +199,36 @@ def run_fold(config: dict, fold: int, device: torch.device,
     )
 
     # Joint datasets for training
-    # V9: off-line oversampling — 77sets ×4, ISLE ×2 (only training set)
-    joint_train = JointDataset(ds77_train, ds_isle_train, augment_77=4, augment_isle=2)
+    joint_train = JointDataset(
+        ds77_train,
+        ds_isle_train,
+        augment_77=sampling_cfg.get("augment_77", 1),
+        augment_isle=sampling_cfg.get("augment_isle", 1),
+    )
     joint_val = JointDataset(ds77_val, ds_isle_val)
 
-    use_interleaved = config["ablation"].get("use_domain_loss", True)
-    if use_interleaved:
-        from data_provider.joint_sampler import InterleavedBatchSampler
+    strategy = sampling_cfg.get("strategy", "auto")
+    if strategy == "auto":
+        strategy = "interleaved" if config["ablation"].get("use_domain_loss", True) else "random"
+    if strategy == "balanced_full":
+        train_sampler = BalancedFullSampler(
+            joint_train,
+            batch_size=batch_size,
+            replacement_77=sampling_cfg.get("replacement_77", True),
+            replacement_isle=sampling_cfg.get("replacement_isle", False),
+            balance_77_classes=sampling_cfg.get("balance_77_classes", True),
+            seed=sampling_cfg.get("seed", cv_cfg["seed"]),
+            rank=rank,
+            world_size=world_size,
+        )
+        train_loader = DataLoader(joint_train, batch_sampler=train_sampler,
+                                  collate_fn=joint_collate_fn, num_workers=2, pin_memory=True)
+    elif strategy == "interleaved":
         train_sampler = InterleavedBatchSampler(joint_train, batch_size_each=batch_size // 2,
                                                   rank=rank, world_size=world_size)
         train_loader = DataLoader(joint_train, batch_sampler=train_sampler,
                                   collate_fn=joint_collate_fn, num_workers=2, pin_memory=True)
-    else:
-        # V9: random shuffle — DistributedSampler for DDP, RandomSampler for single GPU
+    elif strategy == "random":
         if world_size > 1:
             from torch.utils.data import DistributedSampler
             sampler = DistributedSampler(joint_train, shuffle=True,
@@ -176,6 +238,8 @@ def run_fold(config: dict, fold: int, device: torch.device,
             sampler = RandomSampler(joint_train, replacement=False)
         train_loader = DataLoader(joint_train, batch_size=batch_size, sampler=sampler,
                                   collate_fn=joint_collate_fn, num_workers=2, pin_memory=True)
+    else:
+        raise ValueError(f"Unsupported sampling strategy: {strategy}")
     val_loader = DataLoader(joint_val, batch_size=batch_size, shuffle=False,
                             collate_fn=joint_collate_fn, num_workers=2, pin_memory=True)
 
@@ -204,7 +268,7 @@ def run_fold(config: dict, fold: int, device: torch.device,
     )
     test_loader77 = DataLoader(ds77_test, batch_size=batch_size, shuffle=False, num_workers=2)
     use_tta = config["eval"]["tta"]
-    y_true77, y_prob77 = evaluate_test_loader(model, test_loader77, device, tta=use_tta)
+    y_true77, y_prob77, subjects77_eval = evaluate_test_loader(model, test_loader77, device, tta=use_tta)
     y_pred77 = (y_prob77 >= val_threshold).astype(int)
     metrics77 = compute_metrics(y_true77, y_pred77, y_prob77)
     metrics77["threshold"] = val_threshold
@@ -214,7 +278,7 @@ def run_fold(config: dict, fold: int, device: torch.device,
         clinical_path=os.path.join(data_root, ds_cfg["isle2024"]["clinical_file"]),
         image_dir=os.path.join(data_root, ds_cfg["isle2024"]["image_dir"]),
         radiomics_brain_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_brain_dir"]),
-        radiomics_lesion_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_lesion_dir"]),
+        radiomics_lesion_dir=lesion_dir,
         subjects=test_subjects_isle, normalize=True, is_train=False,
         clinical_scaler=ds_isle_train.clinical_scaler,
         radiomics_scaler=ds_isle_train.radiomics_scaler,
@@ -222,7 +286,9 @@ def run_fold(config: dict, fold: int, device: torch.device,
     )
     test_loader_isle = DataLoader(ds_isle_test, batch_size=batch_size, shuffle=False,
                                    num_workers=2, collate_fn=joint_collate_fn)
-    y_true_isle, y_prob_isle = evaluate_test_loader(model, test_loader_isle, device, tta=use_tta)
+    y_true_isle, y_prob_isle, subjects_isle_eval = evaluate_test_loader(
+        model, test_loader_isle, device, tta=use_tta
+    )
     y_pred_isle = (y_prob_isle >= val_threshold).astype(int)
     metrics_isle = compute_metrics(y_true_isle, y_pred_isle, y_prob_isle)
     metrics_isle["threshold"] = val_threshold
@@ -236,6 +302,10 @@ def run_fold(config: dict, fold: int, device: torch.device,
         "fold": fold,
         "77sets": {"metrics": metrics77, "y_true": y_true77, "y_prob": y_prob77},
         "ISLE2024": {"metrics": metrics_isle, "y_true": y_true_isle, "y_prob": y_prob_isle},
+        "predictions": (
+            prediction_rows(fold, "77sets", subjects77_eval, y_true77, y_prob77, val_threshold)
+            + prediction_rows(fold, "ISLE2024", subjects_isle_eval, y_true_isle, y_prob_isle, val_threshold)
+        ),
     }
 
 
@@ -260,6 +330,9 @@ def main() -> None:
     # Resolve relative paths against project root
     data_root = str(project_root / paths["data_root"])
     results_root = str(project_root / paths["results_root"])
+    config["paths"]["data_root"] = data_root
+    config["paths"]["results_root"] = results_root
+    lesion_dir = resolve_isle_lesion_dir(config, data_root)
 
     # Reference datasets (no normalization - used only for subject enumeration)
     ds77_ref = Dataset77sets(
@@ -273,7 +346,7 @@ def main() -> None:
         clinical_path=os.path.join(data_root, ds_cfg["isle2024"]["clinical_file"]),
         image_dir=os.path.join(data_root, ds_cfg["isle2024"]["image_dir"]),
         radiomics_brain_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_brain_dir"]),
-        radiomics_lesion_dir=os.path.join(data_root, ds_cfg["isle2024"]["radiomics_lesion_dir"]),
+        radiomics_lesion_dir=lesion_dir,
         normalize=False,
         target_shape=tuple(config["image"]["target_shape"]),
     )
@@ -282,6 +355,7 @@ def main() -> None:
     all_y_prob: dict = {"77sets": [], "ISLE2024": []}
     all_results_77: list = []
     all_results_isle: list = []
+    all_predictions: list = []
     val_thresholds: list = []
 
     for fold in range(cv_cfg["n_folds"]):
@@ -295,6 +369,7 @@ def main() -> None:
         all_y_prob["77sets"].append(fold_result["77sets"]["y_prob"])
         all_y_true["ISLE2024"].append(fold_result["ISLE2024"]["y_true"])
         all_y_prob["ISLE2024"].append(fold_result["ISLE2024"]["y_prob"])
+        all_predictions.extend(fold_result["predictions"])
         val_thresholds.append(fold_result["77sets"]["metrics"].get("threshold", 0.5))
 
     if rank != 0:
@@ -316,6 +391,8 @@ def main() -> None:
     # Bootstrap CI on pooled predictions (use mean validation threshold)
     results_dir = Path(results_root)
     results_dir.mkdir(parents=True, exist_ok=True)
+    csv_dir = results_dir / "joint"
+    csv_dir.mkdir(parents=True, exist_ok=True)
     pooled_threshold = float(np.mean(val_thresholds)) if val_thresholds else 0.5
 
     for ds_name in all_y_true:
@@ -325,7 +402,9 @@ def main() -> None:
         y_pred_pooled = (y_prob_pooled >= pooled_threshold).astype(int)
 
         ci_results = bootstrap_ci(y_true_pooled, y_prob_pooled,
-                                  n_iter=config["eval"]["bootstrap_n"])
+                                  n_iter=config["eval"]["bootstrap_n"],
+                                  alpha=config["eval"].get("ci_alpha", 0.05),
+                                  fixed_threshold=pooled_threshold)
         metrics = compute_metrics(y_true_pooled, y_pred_pooled, y_prob_pooled)
 
         print(f"\n{ds_name} (pooled):")
@@ -337,8 +416,6 @@ def main() -> None:
         for name, info in ci_results.items():
             df[f"{name}_ci_lower"] = info["ci_lower"]
             df[f"{name}_ci_upper"] = info["ci_upper"]
-        csv_dir = results_dir / "joint"
-        csv_dir.mkdir(parents=True, exist_ok=True)
         df.to_csv(csv_dir / f"metrics_{ds_name}.csv", index=False)
 
         # ROC curve
@@ -350,6 +427,8 @@ def main() -> None:
         plot_confusion_matrix(y_true_pooled, y_pred_pooled,
                               title=f"Confusion Matrix - {ds_name}",
                               save_path=str(csv_dir / "confmat" / f"confmat_{ds_name}.tif"))
+
+    pd.DataFrame(all_predictions).to_csv(csv_dir / "predictions.csv", index=False)
 
     # Save fold results JSON
     fold_summary = {

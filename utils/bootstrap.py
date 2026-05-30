@@ -1,5 +1,5 @@
 """Bootstrap 95% confidence intervals for all metrics."""
-from typing import Tuple
+from typing import Optional, Tuple
 import numpy as np
 from sklearn.metrics import f1_score
 from .metrics import compute_metrics
@@ -7,7 +7,8 @@ from .metrics import compute_metrics
 
 def bootstrap_ci(y_true: np.ndarray, y_prob: np.ndarray,
                  n_iter: int = 1000, alpha: float = 0.05,
-                 seed: int = 42) -> dict:
+                 seed: int = 42,
+                 fixed_threshold: Optional[float] = None) -> dict:
     """Compute 95% CI for all metrics via bootstrap resampling."""
     rng = np.random.RandomState(seed)
     n = len(y_true)
@@ -19,8 +20,8 @@ def bootstrap_ci(y_true: np.ndarray, y_prob: np.ndarray,
         yt, yp = y_true[idx], y_prob[idx]
         if len(np.unique(yt)) < 2:
             continue
-        best_t, _ = _find_thresh(yt, yp)
-        pred = (yp >= best_t).astype(int)
+        threshold = fixed_threshold if fixed_threshold is not None else _find_thresh(yt, yp)[0]
+        pred = (yp >= threshold).astype(int)
         m = compute_metrics(yt, pred, yp)
         for k in metric_names:
             all_metrics[k].append(m[k])

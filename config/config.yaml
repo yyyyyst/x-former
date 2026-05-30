@@ -48,6 +48,18 @@ image:
     - [40, 380]
 
 # ---------------------------------------------------------------------------
+# 采样配置
+# ---------------------------------------------------------------------------
+sampling:
+  strategy: "balanced_full"  # V10: ISLE全量一次，77sets replacement补齐
+  augment_77: 1
+  augment_isle: 1
+  replacement_77: true
+  replacement_isle: false
+  balance_77_classes: true
+  seed: 42
+
+# ---------------------------------------------------------------------------
 # 模型超参数
 # ---------------------------------------------------------------------------
 model:
@@ -79,28 +91,33 @@ model:
   classifier:
     hidden_dims: [256, 128]
     dropout: 0.3  # V5: 恢复V2水平
+    adapter:
+      enabled: false  # V10-adapter时再打开；默认V10-sanity保持共享分类头
+      hidden_dim: 64
+      scale: 0.2
 
 # ---------------------------------------------------------------------------
 # 训练超参数
 # ---------------------------------------------------------------------------
 training:
-  batch_size: 6  # V6: 加速一倍
-  accumulation_steps: 4  # V8 DDP: 3卡×8batch×4accum=96有效batch  # V5: 恢复V2
-  max_epochs: 150
-  early_stop_patience: 35
+  batch_size: 4  # V10: 降低小样本记忆风险
+  accumulation_steps: 8  # V10: 保持稳定有效batch
+  max_epochs: 120
+  early_stop_patience: 25
 
   optimizer:
     name: "adamw"
-    lr: 5.0e-5
-    weight_decay: 0.05  # V5: 恢复V2
+    lr: 3.0e-5
+    weight_decay: 0.08  # V10: 针对V9 loss快速归零加强正则
     betas: [0.9, 0.999]
 
   scheduler:
-    name: "cosine_warm_restart"
-    T_0: 15  # V5: 恢复V2
+    name: "cosine"
+    T_0: 15
     T_mult: 2
     eta_min: 1.0e-7
-    warmup_epochs: 5
+    warmup_epochs: 8
+    T_max: 120
 
   mixed_precision: true
   grad_clip_norm: 1.0
@@ -116,20 +133,29 @@ training:
 # ---------------------------------------------------------------------------
 losses:
   focal:
-    alpha: 0.85  # V4: 加强少数类学习
-    gamma: 2.0
+    alpha: 0.80
+    gamma: 1.5
     weight: 1.0
 
   domain:
-    weight: 0.05  # V8: 回V2水平，ISLE需要域对抗对齐CT特征
-    grl_lambda: 0.1
+    weight: 0.01  # V10: 弱域正则，不让GRL主导瓶颈
+    grl_lambda: 0.05
 
   contrastive:
-    weight: 0.02  # V8: 介于V2(0.03)和V5(0)之间，平衡77sets/ISLE
+    weight: 0.005  # V10: 仅做轻量跨模态对齐
     temperature: 0.1
 
   consistency:
-    weight: 0.05
+    weight: 0.0  # V10全脑-only：不使用lesion相关一致性约束
+
+  warmup:
+    enabled: true
+    contrastive_start_epoch: 10
+    contrastive_ramp_epochs: 30
+    domain_start_epoch: 20
+    domain_ramp_epochs: 20
+    consistency_start_epoch: 0
+    consistency_ramp_epochs: 1
 
 # ---------------------------------------------------------------------------
 # 交叉验证
@@ -158,9 +184,9 @@ eval:
 ablation:
   use_bottleneck: true
   use_perceiver: true
-  use_domain_loss: false  # V9: 关域对抗→随机采样→ISLE数据100%利用
-  use_contrastive_loss: false  # V9: V5验证最优，关对比损失
-  use_consistency_loss: false  # 依赖病灶数据，与 use_lesion 同步
-  use_lesion: false  # 病灶影像组学（第一篇未使用，先关闭，全脑为主）
+  use_domain_loss: true  # V10: 弱域正则
+  use_contrastive_loss: true  # V10: 极轻量对比约束
+  use_consistency_loss: false  # V10全脑-only，不使用lesion
+  use_lesion: false  # 第一篇未使用且当前lesion数据不规范，主实验关闭
   use_proto_clinical: true
   joint_training: true

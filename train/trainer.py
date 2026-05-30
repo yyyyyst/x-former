@@ -37,11 +37,12 @@ class Trainer:
         # Ablation flags
         self.use_domain_loss = abl_cfg.get("use_domain_loss", True)
         self.use_contrastive = abl_cfg.get("use_contrastive_loss", True)
-        self.use_consistency = abl_cfg.get("use_consistency_loss", True)
+        self.use_consistency = abl_cfg.get("use_consistency_loss", False)
 
         self.lambda_domain = loss_cfg["domain"]["weight"]
         self.lambda_contrast = loss_cfg["contrastive"]["weight"]
         self.lambda_consist = loss_cfg["consistency"]["weight"]
+        self.loss_warmup_cfg = loss_cfg.get("warmup", {})
 
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -61,15 +62,43 @@ class Trainer:
 
     def _build_scheduler(self) -> None:
         sc_cfg = self.config["training"]["scheduler"]
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=sc_cfg["T_0"], T_mult=sc_cfg["T_mult"],
-            eta_min=sc_cfg["eta_min"],
-        )
+        name = sc_cfg.get("name", "cosine_warm_restart")
+        if name == "cosine":
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=sc_cfg.get("T_max", self.max_epochs),
+                eta_min=sc_cfg["eta_min"],
+            )
+        elif name in {"cosine_warm_restart", "cosine_warm_restarts"}:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer, T_0=sc_cfg["T_0"], T_mult=sc_cfg["T_mult"],
+                eta_min=sc_cfg["eta_min"],
+            )
+        else:
+            self.scheduler = None
+
+    def _scheduled_loss_weight(self, name: str, base_weight: float, epoch: int) -> float:
+        warmup_cfg = self.loss_warmup_cfg
+        if not warmup_cfg.get("enabled", False):
+            return base_weight
+        current_epoch = epoch + 1
+        start_epoch = warmup_cfg.get(f"{name}_start_epoch", 0)
+        ramp_epochs = max(1, warmup_cfg.get(f"{name}_ramp_epochs", 1))
+        if current_epoch < start_epoch:
+            return 0.0
+        elapsed = current_epoch if start_epoch <= 0 else current_epoch - start_epoch + 1
+        scale = min(1.0, elapsed / ramp_epochs)
+        return base_weight * scale
 
     def train_epoch(self, loader: DataLoader, epoch: int) -> Dict[str, float]:
         self.model.train()
         if hasattr(loader, 'batch_sampler') and hasattr(loader.batch_sampler, 'set_epoch'):
             loader.batch_sampler.set_epoch(epoch)
+        if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'set_epoch'):
+            loader.sampler.set_epoch(epoch)
+        domain_weight = self._scheduled_loss_weight("domain", self.lambda_domain, epoch)
+        contrast_weight = self._scheduled_loss_weight("contrastive", self.lambda_contrast, epoch)
+        consist_weight = self._scheduled_loss_weight("consistency", self.lambda_consist, epoch)
         total_loss = 0.0
         total_focal = 0.0
         total_domain = 0.0
@@ -82,7 +111,10 @@ class Trainer:
                      for k, v in batch.items()}
 
             with autocast(enabled=self.scaler is not None):
-                outputs = self.model(batch, return_domain=self.use_domain_loss)
+                outputs = self.model(
+                    batch,
+                    return_domain=self.use_domain_loss and domain_weight > 0.0,
+                )
                 logits = outputs["logits"]
                 labels = batch["label"]
 
@@ -90,23 +122,23 @@ class Trainer:
                 loss = loss_focal
 
                 # Domain adversarial loss (GRL applied inside model)
-                if self.use_domain_loss:
-                    loss_domain = self.lambda_domain * F.cross_entropy(
+                if self.use_domain_loss and domain_weight > 0.0:
+                    loss_domain = domain_weight * F.cross_entropy(
                         outputs["domain_logits"], batch["dataset_id"])
                     loss = loss + loss_domain
                 else:
                     loss_domain = torch.tensor(0.0, device=self.device)
 
                 # Supervised contrastive loss
-                if self.use_contrastive:
-                    loss_contrast = self.lambda_contrast * self.contrastive_loss(
+                if self.use_contrastive and contrast_weight > 0.0:
+                    loss_contrast = contrast_weight * self.contrastive_loss(
                         outputs["bottleneck_features"], labels)
                     loss = loss + loss_contrast
                 else:
                     loss_contrast = torch.tensor(0.0, device=self.device)
 
                 # Consistency loss (with/without lesion for ISLE samples)
-                if self.use_consistency and "lesion_radiomics" in batch:
+                if self.use_consistency and consist_weight > 0.0 and "lesion_radiomics" in batch:
                     has_l = batch.get("has_lesion", None)
                     if has_l is not None and has_l.any():
                         batch_no_l = {k: v for k, v in batch.items()
@@ -116,7 +148,7 @@ class Trainer:
                         with torch.no_grad():
                             out_no_l = self.model(batch_no_l, return_domain=False)
                         self.model.train()
-                        loss_consist = self.lambda_consist * self.consistency_loss_fn(
+                        loss_consist = consist_weight * self.consistency_loss_fn(
                             logits[has_l], out_no_l["logits"][has_l])
                         loss = loss + loss_consist
                     else:

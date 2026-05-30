@@ -48,7 +48,7 @@ class XFormer(nn.Module):
 
         self.use_perceiver = abl_cfg.get("use_perceiver", True)
         self.use_bottleneck = abl_cfg.get("use_bottleneck", True)
-        self.use_lesion = abl_cfg.get("use_lesion", True)
+        self.use_lesion = abl_cfg.get("use_lesion", False)
         self.use_proto_clinical = abl_cfg.get("use_proto_clinical", True)
         self.joint_training = abl_cfg.get("joint_training", True)
         self.grl_lambda = loss_cfg["domain"]["grl_lambda"]
@@ -96,6 +96,7 @@ class XFormer(nn.Module):
         # Classifier head
         cls_layers = []
         prev_dim = bn_cfg["n_slots"] * bn_cfg["dim"]
+        flat_dim = prev_dim
         for hd in cls_cfg["hidden_dims"]:
             cls_layers.extend([
                 nn.Linear(prev_dim, hd),
@@ -105,6 +106,22 @@ class XFormer(nn.Module):
             prev_dim = hd
         cls_layers.append(nn.Linear(prev_dim, 2))
         self.classifier = nn.Sequential(*cls_layers)
+
+        adapter_cfg = cls_cfg.get("adapter", {})
+        self.use_classifier_adapter = adapter_cfg.get("enabled", False)
+        self.adapter_scale = adapter_cfg.get("scale", 0.2)
+        if self.use_classifier_adapter:
+            adapter_emb_dim = adapter_cfg.get("embedding_dim", 8)
+            adapter_hidden_dim = adapter_cfg.get("hidden_dim", 64)
+            self.adapter_dataset_embedding = nn.Embedding(2, adapter_emb_dim)
+            self.classifier_adapter = nn.Sequential(
+                nn.Linear(flat_dim + adapter_emb_dim, adapter_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(cls_cfg["dropout"]),
+                nn.Linear(adapter_hidden_dim, 2),
+            )
+            nn.init.zeros_(self.classifier_adapter[-1].weight)
+            nn.init.zeros_(self.classifier_adapter[-1].bias)
 
         self.domain_classifier = nn.Sequential(
             nn.Linear(bn_cfg["dim"] * bn_cfg["n_slots"], 128),
@@ -151,6 +168,12 @@ class XFormer(nn.Module):
 
         flat = bottleneck_feat.flatten(1)
         logits = self.classifier(flat)
+        if self.use_classifier_adapter:
+            adapter_input = torch.cat([
+                flat,
+                self.adapter_dataset_embedding(dataset_id),
+            ], dim=1)
+            logits = logits + self.adapter_scale * self.classifier_adapter(adapter_input)
 
         if return_domain:
             domain_logits = self.domain_classifier(

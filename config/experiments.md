@@ -343,3 +343,79 @@
 **训练集规模:** 77×4 + 149×2 = 308 + 298 = 606 有效样本 (原来 ~145)
 
 **预期:** 77sets pooled≥0.82, ISLE pooled≥0.80, 首次两数据集同时超第一篇。单卡训练 (DDP 超时问题)。
+
+### 实际结果
+
+**日志:** `logs/xformer_20260529_144046.log`  
+**实际运行:** 3 卡 DDP，`World size: 3`
+
+| Fold | Val AUC | 77sets Test AUC | ISLE Test AUC | Threshold |
+|------|---------|-----------------|---------------|-----------|
+| 1 | 0.854 | 0.825 | 0.750 | 0.80 |
+| 2 | 0.826 | 0.794 | 0.860 | 0.48 |
+| 3 | 0.839 | 0.714 | 0.875 | 0.88 |
+| 4 | 0.826 | 0.821 | 0.770 | 0.90 |
+| 5 | 0.839 | 0.714 | 0.605 | 0.58 |
+
+| 指标 | 77sets | ISLE2024 |
+|------|--------|----------|
+| AUC (mean±std) | 0.774±0.050 | 0.772±0.097 |
+| Pooled AUC (log bootstrap) | 0.751 | 0.740 |
+| Pooled AUC (CSV fixed threshold) | 0.750 | 0.739 |
+| Accuracy (CSV fixed threshold) | 0.675 | 0.718 |
+| F1 (CSV fixed threshold) | 0.673 | 0.657 |
+
+### V9 结论
+
+- V9 没超过第一篇：Tri-CAF 参考为 77sets AUC=0.813、ISLE AUC=0.836。
+- 训练 loss 在多个 fold 很快接近 0，说明 `77sets×4, ISLE×2` 的重复采样让模型记忆训练集。
+- `use_domain_loss=false` 且 `use_contrastive_loss=false` 后，模型只靠 focal loss 学分类，跨模态表示不稳定。
+- DDP 随机采样分支使用 `DistributedSampler`，但 `Trainer.train_epoch()` 未调用 `loader.sampler.set_epoch(epoch)`，每轮 shuffle 可能重复。
+- 阈值从 0.48 到 0.90 大幅波动，概率校准差。AUC 也未达标，不能靠调阈值解决。
+- 日志中的 bootstrap Accuracy/F1 和 CSV 不一致：bootstrap 内部重新搜索 threshold，CSV 使用 mean validation threshold。论文表格应使用固定验证阈值口径。
+
+---
+
+## V10 — 全脑-only 稳定化路线
+
+**日期:** 2026-05-31  
+**核心约束:** 第一篇未使用 lesion，且当前 lesion 数据不完整、不规范，因此 V10 主线只使用全脑影像/全脑 radiomics/临床数据。
+
+### V10-sanity 默认配置
+
+| 参数 | V9 | V10-sanity | 原因 |
+|------|----|------------|------|
+| 采样 | RandomSampler + hard-code oversampling | `balanced_full` | ISLE 全量参与，77sets replacement 补齐，避免高倍复制记忆 |
+| augment_77 / augment_isle | 4 / 2 | 1 / 1 | 取消离线重复，只保留在线增强 |
+| use_domain_loss | false | true | 只作为弱正则恢复跨模态约束 |
+| domain.weight | 0.05 | 0.01 | 避免 GRL 抢瓶颈分类梯度 |
+| grl_lambda | 0.1 | 0.05 | 降低域对抗强度 |
+| use_contrastive_loss | false | true | 对 ISLE 有历史收益，但需极低权重 |
+| contrastive.weight | 0.02 | 0.005 | 只做轻量对齐 |
+| use_lesion | false | false | 保持与第一篇公平可比 |
+| use_consistency_loss | false | false | consistency 当前依赖 lesion 分支 |
+| batch_size | 6 | 4 | 降低小样本记忆风险 |
+| accumulation_steps | 4 | 8 | 保持稳定有效 batch |
+| lr | 5e-5 | 3e-5 | 降低过拟合速度 |
+| weight_decay | 0.05 | 0.08 | 加强正则 |
+| scheduler | cosine warm restart | cosine | 不再反复高 LR 重启已记忆模型 |
+| max_epochs / patience | 150 / 35 | 120 / 25 | 更早停止过拟合 |
+
+### V10 工程修复
+
+- 采样参数写入 `config/config.yaml`，不再在 `train/crossval_joint.py` hard-code。
+- 新增 `BalancedFullSampler`：每个 epoch 使用 ISLE 训练样本一次，77sets replacement 采样到相同规模，batch 近似 1:1。
+- DDP 下同时调用 `loader.batch_sampler.set_epoch()` 和 `loader.sampler.set_epoch()`。
+- bootstrap 支持固定阈值，日志/CSV/论文表格使用同一阈值口径。
+- 保存 per-subject prediction CSV：`fold,dataset,subject,y_true,y_prob,threshold,y_pred`。
+- 可选 dataset-conditioned residual adapter 保留为后续 V10-adapter，但默认关闭；它不使用 lesion，只基于共享瓶颈和 dataset_id 做轻量校准。
+
+### V10 实验顺序
+
+| 版本 | 改动 | 通过标准 |
+|------|------|----------|
+| V10-sanity | 采样/DDP/阈值修复 + light domain/contrastive，全脑-only | 77sets pooled AUC ≥0.80，ISLE pooled AUC ≥0.76，Fold 5 不再崩 |
+| V10-adapter | 在 V10-sanity 基础上开启 dataset-conditioned residual adapter | 77sets pooled AUC ≥0.813，ISLE pooled AUC ≥0.79 |
+| V10-report | 选择 sanity/adapter 中更稳定版本做主结果 | 全脑-only，对第一篇公平可比 |
+
+如果全脑-only V10 无法把 ISLE 推到 0.836，论文叙事应改为“跨模态联合训练可提升/接近单模态第一篇”，而不是强行引入 lesion 数据冲指标。
