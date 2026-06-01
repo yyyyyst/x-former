@@ -415,7 +415,163 @@
 | 版本 | 改动 | 通过标准 |
 |------|------|----------|
 | V10-sanity | 采样/DDP/阈值修复 + light domain/contrastive，全脑-only | 77sets pooled AUC ≥0.80，ISLE pooled AUC ≥0.76，Fold 5 不再崩 |
-| V10-adapter | 在 V10-sanity 基础上开启 dataset-conditioned residual adapter | 77sets pooled AUC ≥0.813，ISLE pooled AUC ≥0.79 |
+| V10-adapter | 在 V10-sanity 基础上开启 dataset-conditioned residual adapter | 已完成，未达标，见 `V10-adapter-min-ckpt 实际结果` |
 | V10-report | 选择 sanity/adapter 中更稳定版本做主结果 | 全脑-only，对第一篇公平可比 |
+
+### V10-sanity 实际结果
+
+**日期:** 2026-05-31  
+**日志:** `logs/xformer_20260531_010714.log`  
+**实际运行:** 单卡，`Device: cuda:0, World size: 1`  
+**核心配置:** `balanced_full`，`augment_77=1`，`augment_isle=1`，`use_lesion=false`，`domain.weight=0.01`，`contrastive.weight=0.005`，adapter 关闭。
+
+| Fold | Best Val AUC | Best Epoch | Threshold | 77sets Test AUC | ISLE Test AUC |
+|------|-------------:|-----------:|----------:|----------------:|--------------:|
+| 1 | 0.8354 | 36 | 0.50 | 0.8095 | 0.6950 |
+| 2 | 0.8137 | 55 | 0.33 | 0.8889 | 0.9400 |
+| 3 | 0.8851 | 25 | 0.69 | 0.7321 | 0.8350 |
+| 4 | 0.8323 | 49 | 0.68 | 0.9464 | 0.7650 |
+| 5 | 0.8385 | 14 | 0.64 | 0.6607 | 0.6000 |
+
+| 指标 | 77sets | ISLE2024 |
+|------|--------|----------|
+| AUC mean±std | 0.8075±0.1153 | 0.7670±0.1300 |
+| Pooled AUC (fixed threshold CSV) | 0.7912 | 0.7846 |
+| 95% CI | 0.6930-0.8779 | 0.7068-0.8594 |
+| Accuracy | 0.7143 | 0.7248 |
+| F1-macro | 0.7142 | 0.7162 |
+| Fixed threshold | 0.568 | 0.568 |
+
+### V10-sanity 结论
+
+- 相比 V9 fixed-threshold pooled AUC，77sets 从 `0.750` 提升到 `0.791`，ISLE 从 `0.739` 提升到 `0.785`，说明 `balanced_full + light domain/contrastive + 去高倍复制` 方向有效。
+- 仍未超过第一篇：Tri-CAF 参考为 77sets `0.813`、ISLE `0.836`；当前差距约为 77sets `-0.022`、ISLE `-0.051`。
+- 主要失败点是 Fold 5：77sets `0.6607`、ISLE `0.6000`。Fold 5 的 best checkpoint 出现在 epoch 14，而 domain loss epoch 20 才启动，说明保存了 warmup 前的早期验证尖峰。
+- Fold 5 概率分布塌缩：77sets 正/负均值约 `0.637/0.634`，ISLE 正/负均值约 `0.601/0.565`。这是 checkpoint 选择和校准问题，不是 lesion 信息不足导致。
+- V10-sanity 达到 ISLE 最低通过线，但 Fold 5 未解决；下一步应做全脑-only 的 `V10-adapter-min-ckpt`，不引入 lesion。
+
+### V10-adapter-min-ckpt 配置
+
+| 参数 | V10-sanity | V10-adapter-min-ckpt | 原因 |
+|------|------------|----------------------|------|
+| classifier.adapter.enabled | false | **true** | 给 MRI/CT 轻量 residual 校准能力，不拆成两个模型 |
+| classifier.adapter.scale | 0.2(未启用) | **0.1** | 限制 adapter 影响，避免小样本过拟合 |
+| training.min_checkpoint_epoch | 无 | **25** | 禁止保存 domain/contrastive warmup 前的早期尖峰 |
+| use_lesion | false | **false** | 保持与第一篇公平可比 |
+| domain / contrastive | 0.01 / 0.005 | 不变 | V10-sanity 已证明轻量约束有效 |
+
+### V10-adapter-min-ckpt 实际结果
+
+**日期:** 2026-05-31  
+**日志:** `logs/xformer_20260531_194526.log`  
+**实际运行:** 单卡，`Device: cuda:0, World size: 1`  
+**核心配置:** `balanced_full`，`augment_77=1`，`augment_isle=1`，`use_lesion=false`，`domain.weight=0.01`，`contrastive.weight=0.005`，`classifier.adapter.enabled=true`，`adapter.scale=0.1`，`min_checkpoint_epoch=25`。
+
+| Fold | Best Val AUC | Best Epoch | Threshold | 77sets Test AUC | ISLE Test AUC |
+|------|-------------:|-----------:|----------:|----------------:|--------------:|
+| 1 | 0.7950 | 32 | 0.73 | 0.8254 | 0.7000 |
+| 2 | 0.7671 | 34 | 0.62 | 0.7619 | 0.8650 |
+| 3 | 0.8851 | 38 | 0.70 | 0.7679 | 0.8550 |
+| 4 | 0.8416 | 66 | 0.67 | 0.8750 | 0.7150 |
+| 5 | 0.8323 | 28 | 0.61 | 0.6964 | 0.7842 |
+
+| 指标 | 77sets | ISLE2024 |
+|------|--------|----------|
+| AUC mean±std | 0.7853±0.0607 | 0.7838±0.0684 |
+| Pooled AUC (fixed threshold CSV) | 0.7544 | 0.7451 |
+| Pooled AUC (log bootstrap) | 0.7550 | 0.7459 |
+| 95% CI | 0.6442-0.8638 | 0.6574-0.8267 |
+| Accuracy | 0.6883 | 0.7248 |
+| F1-macro | 0.6878 | 0.7011 |
+| Fixed threshold | 0.666 | 0.666 |
+
+### V10-adapter-min-ckpt vs V10-sanity
+
+| Fold | 77sets ΔAUC | ISLE ΔAUC | 主要变化 |
+|------|------------:|----------:|----------|
+| 1 | +0.0159 | +0.0050 | 基本持平，但 Val AUC 下降 |
+| 2 | -0.1270 | -0.0750 | adapter 明显伤害排序，是 pooled AUC 下跌主因之一 |
+| 3 | +0.0358 | +0.0200 | 小幅改善 |
+| 4 | -0.0714 | -0.0500 | 77sets 仍高，但 ISLE 被拉低，gap 扩大到 0.1600 |
+| 5 | +0.0357 | +0.1842 | Fold 5 修复明显，主要来自 `min_checkpoint_epoch=25` 避开 epoch 14 早期尖峰 |
+
+| 指标 | V10-sanity | V10-adapter-min-ckpt | 变化 |
+|------|-----------:|---------------------:|-----:|
+| 77sets pooled AUC | 0.7912 | 0.7544 | -0.0368 |
+| ISLE pooled AUC | 0.7846 | 0.7451 | -0.0395 |
+| 77sets Accuracy | 0.7143 | 0.6883 | -0.0260 |
+| ISLE Accuracy | 0.7248 | 0.7248 | +0.0000 |
+| 77sets F1-macro | 0.7142 | 0.6878 | -0.0264 |
+| ISLE F1-macro | 0.7162 | 0.7011 | -0.0151 |
+
+### V10-adapter-min-ckpt 概率诊断
+
+基于 `results/joint/predictions.csv` 重新计算，当前概率分布没有全局塌缩，但存在明显 fold 级别排序和校准不稳。
+
+| Fold | Dataset | AUC | Thr | Pos mean | Neg mean | Gap | FP/FN |
+|------|---------|----:|----:|---------:|---------:|----:|------:|
+| 1 | 77sets | 0.8254 | 0.73 | 0.7812 | 0.6633 | 0.1179 | 4/2 |
+| 1 | ISLE | 0.7000 | 0.73 | 0.7189 | 0.6178 | 0.1011 | 9/3 |
+| 2 | 77sets | 0.7619 | 0.62 | 0.6516 | 0.4019 | 0.2497 | 2/3 |
+| 2 | ISLE | 0.8650 | 0.62 | 0.6377 | 0.3491 | 0.2886 | 3/3 |
+| 3 | 77sets | 0.7679 | 0.70 | 0.7225 | 0.5608 | 0.1617 | 3/2 |
+| 3 | ISLE | 0.8550 | 0.70 | 0.6701 | 0.4545 | 0.2155 | 3/4 |
+| 4 | 77sets | 0.8750 | 0.67 | 0.7781 | 0.4214 | 0.3567 | 3/1 |
+| 4 | ISLE | 0.7150 | 0.67 | 0.6662 | 0.4063 | 0.2599 | 5/3 |
+| 5 | 77sets | 0.6964 | 0.61 | 0.5347 | 0.4399 | 0.0948 | 2/4 |
+| 5 | ISLE | 0.7842 | 0.61 | 0.6351 | 0.4273 | 0.2078 | 5/3 |
+
+Pooled 级别：77sets 正/负均值 `0.6936/0.4991`，gap `0.1945`；ISLE 正/负均值 `0.6656/0.4512`，gap `0.2143`。均值 gap 看似足够，但 AUC 只有 `0.7544/0.7451`，说明错误主要来自跨 fold 的排序不一致，而不是所有病例都不可分。
+
+### V10-adapter-min-ckpt 问题分析
+
+- `min_checkpoint_epoch=25` 生效，Fold 5 best epoch 从 V10-sanity 的 `14` 推迟到 `28`，Fold 5 也从 `77sets=0.6607/ISLE=0.6000` 提升到 `0.6964/0.7842`。因此上一版的早期 checkpoint 问题被部分修复。
+- 但整体 pooled AUC 反而明显下降：77sets `0.7912 -> 0.7544`，ISLE `0.7846 -> 0.7451`。这说明当前问题不是单纯阈值或 checkpoint，而是 adapter 结构对排序能力产生了负收益。
+- 负收益集中在 Fold 2 和 Fold 4：这两个 fold 在 V10-sanity 中贡献了较高 pooled 排序，本版分别下降 `0.127/0.075` 和 `0.071/0.050`。Fold 5 的提升不足以抵消这些折的退化。
+- Fold 1 和 Fold 4 的跨模态 gap 分别达到 `0.1254`、`0.1600`，平均 gap `0.1127±0.0274`，高于目标 `<0.08`。共享瓶颈没有得到更好的跨模态对齐。
+- adapter 的设计目标是校准 MRI/CT 决策边界，但 AUC 是阈值无关指标，AUC 同时下降说明它不只是校准失败，而是改变了样本排序。dataset-conditioned residual 可能让模型利用 dataset id 做队列特异拟合，削弱共享 outcome 表示。
+- 当前模型已经有 clinical dataset embedding，adapter 又在分类头显式输入 `dataset_id`，相当于给队列身份两次进入决策路径。小样本下这会提高队列特异拟合风险，和“共享瓶颈学习跨模态结局表示”的论文核心相冲突。
+- 概率分布没有全局塌缩，但存在 fold 级别排序弱化。77sets Fold 5 正/负均值仅 `0.5347/0.4399`，gap `0.0948`；ISLE Fold 1 正/负均值 `0.7189/0.6178`，gap `0.1011`，导致大量高概率假阳性。
+- 训练后期 focal loss 继续下降到很低，contrastive 项相对占比升高；在 adapter 额外自由度存在时，轻量对齐损失可能仍会把共享瓶颈拉向“队列对齐”而非“结局排序”。下一步应隔离 `min_checkpoint_epoch` 的收益，而不是继续扩大 adapter。
+
+### V10 后续修正方向
+
+下一步不应继续加大 adapter。优先做两个隔离实验：
+
+| 版本 | 改动 | 目的 | 通过标准 |
+|------|------|------|----------|
+| V10-min-ckpt-only | 关闭 adapter，保留 `min_checkpoint_epoch=25` | 判断 Fold 5 修复是否来自 min checkpoint，而不是 adapter | pooled AUC 回到接近 V10-sanity，且 Fold 5 不再低于 0.65 |
+| V10-no-adapter-lowC | 关闭 adapter，`contrastive.weight` 降到 `0.002` 或关闭 domain | 判断后期辅助损失是否压制排序 | pooled AUC ≥ V10-sanity，gap < 0.10 |
+
+### V10-no-adapter-lowC-minckpt 下一版配置
+
+**状态:** 已写入 `config/config.yaml`，准备运行。  
+**目标:** 全脑-only、公平对比第一篇；优先恢复 V10-sanity 的 pooled AUC，同时保留 Fold 5 修复。
+
+| 参数 | V10-adapter-min-ckpt | 下一版 | 原因 |
+|------|----------------------|--------|------|
+| `classifier.adapter.enabled` | true | **false** | adapter 让 pooled AUC 双数据集同时下降约 0.04，已证伪 |
+| `training.min_checkpoint_epoch` | 25 | **25** | 已证明能避开 Fold 5 epoch 14 早期尖峰 |
+| `contrastive.weight` | 0.005 | **0.002** | 保留轻量跨模态正则，但降低训练后期对排序的干扰 |
+| `domain.weight` | 0.01 | **0.01** | 保持弱域正则，不再同时改太多变量 |
+| `sampling.strategy` | balanced_full | **balanced_full** | V10-sanity 已证明比 V9 随机高倍复制更稳 |
+| `use_lesion` | false | **false** | 第一篇未用 lesion，当前 lesion 数据也不规范 |
+
+预期结果不能按“必超第一篇”承诺。基于历史结果，合理区间如下：
+
+| 指标 | 保守预期 | 理想预期 | 第一篇 Tri-CAF |
+|------|---------:|---------:|---------------:|
+| 77sets pooled AUC | 0.79-0.81 | 0.82-0.83 | 0.813 |
+| ISLE pooled AUC | 0.79-0.82 | 0.82-0.84 | 0.836 |
+| 77sets F1-macro | 0.70-0.73 | 0.73-0.75 | 待对齐 |
+| ISLE F1-macro | 0.71-0.74 | 0.74-0.76 | 待对齐 |
+
+这版有机会超过第一篇的 77sets AUC，但 ISLE 要超过 `0.836` 需要 Fold 1 和 Fold 5 同时明显改善。判断标准：
+
+- 若 77sets ≥ `0.813` 且 ISLE ≥ `0.82`，说明主路线接近成功；下一步只做轻量 ISLE-lift。
+- 若 77sets 回到 `0.80+` 但 ISLE 仍 < `0.82`，下一版再把 `contrastive.weight` 回调到 `0.005-0.01`，专门拉 ISLE。
+- 若双数据集仍低于 V10-sanity，说明问题不在 adapter/contrastive，而要回到采样或 checkpoint metric。
+
+若只想提升 Accuracy/F1，应做 dataset-specific threshold 或 temperature scaling；但 AUC 未稳定前，不应把校准方案当成主模型改进。
 
 如果全脑-only V10 无法把 ISLE 推到 0.836，论文叙事应改为“跨模态联合训练可提升/接近单模态第一篇”，而不是强行引入 lesion 数据冲指标。

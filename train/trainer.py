@@ -55,6 +55,7 @@ class Trainer:
         self.accumulation_steps = train_cfg["accumulation_steps"]
         self.max_epochs = train_cfg["max_epochs"]
         self.early_stop_patience = train_cfg["early_stop_patience"]
+        self.min_checkpoint_epoch = train_cfg.get("min_checkpoint_epoch", 1)
         self.grad_clip_norm = train_cfg["grad_clip_norm"]
 
         self.scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
@@ -226,14 +227,17 @@ class Trainer:
     def fit(self, train_loader: DataLoader, val_loader: DataLoader,
             fold: int = 0) -> Dict[str, Any]:
         self._build_scheduler()
-        best_val_auc = 0.0
+        best_val_auc = float("-inf")
+        best_observed_val_auc = float("-inf")
         best_val_threshold = 0.5
         best_state: Optional[Dict] = None
+        best_epoch = 0
         patience_counter = 0
 
         for epoch in range(self.max_epochs):
+            current_epoch = epoch + 1
             if epoch < self.warmup_epochs:
-                lr_scale = (epoch + 1) / self.warmup_epochs
+                lr_scale = current_epoch / self.warmup_epochs
                 for pg in self.optimizer.param_groups:
                     pg['lr'] = self.config["training"]["optimizer"]["lr"] * lr_scale
 
@@ -243,6 +247,18 @@ class Trainer:
 
             val_metrics = self.validate(val_loader)
             val_auc = val_metrics["auc"]
+            checkpoint_eligible = current_epoch >= self.min_checkpoint_epoch
+            improved_observed = val_auc > best_observed_val_auc
+            if improved_observed:
+                best_observed_val_auc = val_auc
+            improved_checkpoint = checkpoint_eligible and val_auc > best_val_auc
+
+            if improved_checkpoint:
+                status_suffix = " *"
+            elif not checkpoint_eligible:
+                status_suffix = f"  (pre-min {current_epoch}/{self.min_checkpoint_epoch})"
+            else:
+                status_suffix = f"  ({patience_counter + 1}/{self.early_stop_patience})"
 
             # Print per-epoch summary (rank 0 only)
             if self.rank == 0:
@@ -257,22 +273,27 @@ class Trainer:
                       f"Val AUC: {val_auc:.4f} "
                       f"Acc: {val_metrics['accuracy']:.4f} "
                       f"F1: {val_metrics['f1_macro']:.4f}"
-                      + (" *" if val_auc > best_val_auc else f"  ({patience_counter + 1}/{self.early_stop_patience})"))
+                      + status_suffix)
 
-            if val_auc > best_val_auc:
+            if improved_checkpoint:
                 best_val_auc = val_auc
                 best_val_threshold = val_metrics.get("threshold", 0.5)
                 best_state = {k: v.clone() for k, v in self._raw_model.state_dict().items()}
+                best_epoch = current_epoch
                 patience_counter = 0
-            else:
+            elif checkpoint_eligible:
                 patience_counter += 1
 
             if patience_counter >= self.early_stop_patience:
                 if self.rank == 0:
-                    print(f"  Early stop at epoch {epoch + 1}, best AUC: {best_val_auc:.4f}")
+                    print(f"  Early stop at epoch {current_epoch}, best AUC: {best_val_auc:.4f}")
                 break
 
         if best_state is not None:
             self._raw_model.load_state_dict(best_state)
+        else:
+            best_val_auc = best_observed_val_auc if np.isfinite(best_observed_val_auc) else 0.0
+            if self.rank == 0:
+                print("  Warning: no checkpoint met min_checkpoint_epoch; using final model state")
         return {"best_val_auc": best_val_auc, "best_val_threshold": best_val_threshold,
-                "epoch": epoch + 1}
+                "best_epoch": best_epoch, "epoch": epoch + 1}

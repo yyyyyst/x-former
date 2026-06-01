@@ -92,9 +92,10 @@ model:
     hidden_dims: [256, 128]
     dropout: 0.3  # V5: 恢复V2水平
     adapter:
-      enabled: false  # V10-adapter时再打开；默认V10-sanity保持共享分类头
+      enabled: false  # V10-no-adapter-lowC-minckpt：adapter已证实拉低pooled AUC
+      embedding_dim: 8
       hidden_dim: 64
-      scale: 0.2
+      scale: 0.1
 
 # ---------------------------------------------------------------------------
 # 训练超参数
@@ -104,6 +105,7 @@ training:
   accumulation_steps: 8  # V10: 保持稳定有效batch
   max_epochs: 120
   early_stop_patience: 25
+  min_checkpoint_epoch: 25  # V10-no-adapter-lowC-minckpt：保留Fold 5修复
 
   optimizer:
     name: "adamw"
@@ -142,7 +144,7 @@ losses:
     grl_lambda: 0.05
 
   contrastive:
-    weight: 0.005  # V10: 仅做轻量跨模态对齐
+    weight: 0.002  # V10-no-adapter-lowC-minckpt：降低后期对排序的干扰
     temperature: 0.1
 
   consistency:
