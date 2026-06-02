@@ -101,8 +101,8 @@ model:
 # 训练超参数
 # ---------------------------------------------------------------------------
 training:
-  batch_size: 4  # V10: 降低小样本记忆风险
-  accumulation_steps: 8  # V10: 保持稳定有效batch
+  batch_size: 8  # V10-minckpt-C005-B8A4: 提高物理batch，保持有效batch=32
+  accumulation_steps: 4  # V10-minckpt-C005-B8A4: 与batch_size=8配套，避免有效batch变成64
   max_epochs: 120
   early_stop_patience: 25
   min_checkpoint_epoch: 25  # V10-no-adapter-lowC-minckpt：保留Fold 5修复
@@ -144,7 +144,7 @@ losses:
     grl_lambda: 0.05
 
   contrastive:
-    weight: 0.002  # V10-no-adapter-lowC-minckpt：降低后期对排序的干扰
+    weight: 0.005  # V10-minckpt-C005-B8A4：回到V10-sanity轻量对齐强度
     temperature: 0.1
 
   consistency:

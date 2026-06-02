@@ -575,3 +575,100 @@ Pooled 级别：77sets 正/负均值 `0.6936/0.4991`，gap `0.1945`；ISLE 正/�
 若只想提升 Accuracy/F1，应做 dataset-specific threshold 或 temperature scaling；但 AUC 未稳定前，不应把校准方案当成主模型改进。
 
 如果全脑-only V10 无法把 ISLE 推到 0.836，论文叙事应改为“跨模态联合训练可提升/接近单模态第一篇”，而不是强行引入 lesion 数据冲指标。
+
+### V10-no-adapter-lowC-minckpt 实际结果
+
+**日期:** 2026-06-01  
+**日志:** `logs/xformer_20260601_154552.log`  
+**实际运行:** 单卡，`Device: cuda:0, World size: 1`  
+**核心配置:** `balanced_full`，`augment_77=1`，`augment_isle=1`，`use_lesion=false`，`classifier.adapter.enabled=false`，`min_checkpoint_epoch=25`，`domain.weight=0.01`，`contrastive.weight=0.002`。
+
+| Fold | Best Val AUC | Best Epoch | Threshold | 77sets Test AUC | ISLE Test AUC |
+|------|-------------:|-----------:|----------:|----------------:|--------------:|
+| 1 | 0.8758 | 53 | 0.79 | 0.8730 | 0.7650 |
+| 2 | 0.8354 | 42 | 0.70 | 0.7937 | 0.8900 |
+| 3 | 0.8758 | 30 | 0.58 | 0.7679 | 0.8050 |
+| 4 | 0.8261 | 39 | 0.64 | 0.8393 | 0.7250 |
+| 5 | 0.8602 | 27 | 0.70 | 0.7679 | 0.7211 |
+
+| 指标 | 77sets | ISLE2024 |
+|------|--------|----------|
+| AUC mean±std | 0.8083±0.0416 | 0.7812±0.0624 |
+| Pooled AUC (CSV) | 0.7714 | 0.7554 |
+| Pooled AUC (log bootstrap) | 0.7713 | 0.7553 |
+| 95% CI | 0.6646-0.8721 | 0.6676-0.8377 |
+| Accuracy | 0.7273 | 0.7450 |
+| F1-macro | 0.7256 | 0.6803 |
+| Pooled threshold | 0.682 | 0.682 |
+| Mean modality gap | 0.0805±0.0321 | — |
+
+### V10-no-adapter-lowC-minckpt vs V10-sanity
+
+| Fold | 77sets ΔAUC | ISLE ΔAUC | 主要变化 |
+|------|------------:|----------:|----------|
+| 1 | +0.0635 | +0.0700 | min checkpoint 后 Fold 1 明显改善 |
+| 2 | -0.0952 | -0.0500 | 原本最强 fold 被削弱，是 pooled AUC 下跌主因之一 |
+| 3 | +0.0358 | -0.0300 | MRI 小幅提升，CT 排序下降 |
+| 4 | -0.1071 | -0.0400 | 77sets 从高点回落，跨模态 gap 仍偏大 |
+| 5 | +0.1072 | +0.1211 | Fold 5 修复有效，但不足以抵消 Fold 2/4 回退 |
+
+| 指标 | V10-sanity | V10-no-adapter-lowC-minckpt | 变化 |
+|------|-----------:|-----------------------------:|-----:|
+| 77sets pooled AUC | 0.7912 | 0.7714 | -0.0198 |
+| ISLE pooled AUC | 0.7846 | 0.7554 | -0.0292 |
+| 77sets Accuracy | 0.7143 | 0.7273 | +0.0130 |
+| ISLE Accuracy | 0.7248 | 0.7450 | +0.0202 |
+| 77sets F1-macro | 0.7142 | 0.7256 | +0.0114 |
+| ISLE F1-macro | 0.7162 | 0.6803 | -0.0359 |
+| Mean modality gap | 未记录 | 0.0805±0.0321 | 接近目标 `<0.08` |
+
+### V10-no-adapter-lowC-minckpt 概率诊断
+
+基于 `results/joint/predictions.csv` 重新计算，adapter 关闭后概率分布比上一版更有分离度，但 Fold 3/5 尤其是 ISLE 仍然偏弱。
+
+| Fold | Dataset | AUC | Thr | Pos mean | Neg mean | Gap | FP/FN |
+|------|---------|----:|----:|---------:|---------:|----:|------:|
+| 1 | 77sets | 0.8730 | 0.79 | 0.7374 | 0.3060 | 0.4315 | 2/2 |
+| 1 | ISLE | 0.7650 | 0.79 | 0.5354 | 0.2602 | 0.2753 | 2/6 |
+| 2 | 77sets | 0.7937 | 0.70 | 0.6975 | 0.3709 | 0.3266 | 2/3 |
+| 2 | ISLE | 0.8900 | 0.70 | 0.6732 | 0.4453 | 0.2279 | 1/3 |
+| 3 | 77sets | 0.7679 | 0.58 | 0.7230 | 0.5687 | 0.1543 | 3/1 |
+| 3 | ISLE | 0.8050 | 0.58 | 0.5914 | 0.4572 | 0.1342 | 3/4 |
+| 4 | 77sets | 0.8393 | 0.64 | 0.7709 | 0.5133 | 0.2576 | 4/1 |
+| 4 | ISLE | 0.7250 | 0.64 | 0.6444 | 0.4823 | 0.1621 | 4/3 |
+| 5 | 77sets | 0.7679 | 0.70 | 0.6206 | 0.4667 | 0.1539 | 0/3 |
+| 5 | ISLE | 0.7211 | 0.70 | 0.5607 | 0.4396 | 0.1211 | 1/7 |
+
+Pooled 级别：77sets 正/负均值 `0.7099/0.4400`，gap `0.2699`；ISLE 正/负均值 `0.6010/0.4167`，gap `0.1843`。77sets 的分离度比 adapter 版更好，但 ISLE 的 gap 变小，尤其 Fold 5 有 7 个 FN，解释了 ISLE F1 从 V10-sanity 的 `0.7162` 降到 `0.6803`。
+
+### V10-no-adapter-lowC-minckpt 结论
+
+- 这一版未超过第一篇：Tri-CAF 参考为 77sets `0.813`、ISLE `0.836`；当前 pooled AUC 分别为 `0.7714/0.7554`。
+- 关闭 adapter 是正确的局部修正：相比 V10-adapter-min-ckpt，pooled AUC 从 `0.7544/0.7451` 回升到 `0.7714/0.7554`，77sets F1 也从 `0.6878` 回升到 `0.7256`。
+- 但把 `contrastive.weight` 从 `0.005` 降到 `0.002` 没有带来预期收益。相比 V10-sanity，77sets pooled AUC 下降 `0.0198`，ISLE pooled AUC 下降 `0.0292`。
+- `min_checkpoint_epoch=25` 继续有效：Fold 5 从 V10-sanity 的 `77sets=0.6607/ISLE=0.6000` 提升到 `0.7679/0.7211`。问题是 Fold 2/4 的回退抵消了 Fold 5 收益。
+- 跨模态 gap 降到 `0.0805±0.0321`，接近目标 `<0.08`，说明 adapter 关闭后共享瓶颈更平衡；但“平衡”不等于“排序更强”，两数据集 pooled AUC 仍下降。
+- 当前主要问题是低对比约束下 CT 侧结局排序不足。ISLE pooled gap 只有 `0.1843`，Fold 5 正负均值差仅 `0.1211`，提示 `contrastive=0.002` 对 ISLE 支撑不够。
+- 下一步不应继续降 contrastive 或重开 adapter。建议跑 `V10-minckpt-C005-noadapter`：`classifier.adapter.enabled=false`，`min_checkpoint_epoch=25`，`contrastive.weight=0.005`，其余保持 V10-sanity/V10-lowC 相同。这个实验能隔离“Fold 5 修复”是否只来自 min checkpoint，而不被低 contrastive 混淆。
+
+### V10-minckpt-C005-B8A4-noadapter 下一版配置
+
+**状态:** 已写入 `config/config.yaml`，准备运行。  
+**目标:** 在 V10-no-adapter-lowC-minckpt 基础上恢复 V10-sanity 的对比约束强度，同时测试更大的物理 batch 是否提升吞吐和 batch 内对齐稳定性。
+
+| 参数 | 上一版 | 下一版 | 原因 |
+|------|--------|--------|------|
+| `classifier.adapter.enabled` | false | **false** | adapter 已证实会降低 pooled AUC，继续关闭 |
+| `training.min_checkpoint_epoch` | 25 | **25** | 保留 Fold 5 修复收益 |
+| `losses.contrastive.weight` | 0.002 | **0.005** | 回到 V10-sanity 的轻量对齐强度，修复低 C 导致的 ISLE 排序不足 |
+| `training.batch_size` | 4 | **8** | 提高物理 batch，增加 batch 内样本对，可能改善 contrastive 稳定性和 GPU 利用率 |
+| `training.accumulation_steps` | 8 | **4** | 保持有效 batch 为 `8*4=32`，避免直接变成 64 后减少优化步数 |
+| `domain.weight` | 0.01 | **0.01** | 保持弱域正则，不再额外引入变量 |
+| `sampling.strategy` | balanced_full | **balanced_full** | 保持 V10 主线采样 |
+| `use_lesion` | false | **false** | 继续全脑-only，保持与第一篇公平对比 |
+
+预期判断：
+
+- 如果 77sets/ISLE pooled AUC 回到或超过 V10-sanity 的 `0.7912/0.7846`，说明 `C=0.005 + min_checkpoint_epoch=25` 能同时保留 Fold 5 修复和轻量对齐收益。
+- 如果相比上一版只提升训练速度但 AUC 不升，说明 batch 不是主矛盾，下一步应回到 `batch_size=4, accumulation_steps=8` 或固定 B8/A4 后搜索 `contrastive=0.0075/0.01`。
+- 如果 AUC 继续低于上一版，说明更大的物理 batch 可能削弱小样本噪声正则，应回退 B4/A8，只保留 `contrastive=0.005` 做隔离实验。
