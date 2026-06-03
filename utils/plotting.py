@@ -1,16 +1,22 @@
-"""Publication-quality plots: 600 DPI, Times New Roman, colorblind-friendly."""
+"""Publication-quality plots: 600 DPI, available serif font, colorblind-friendly."""
 from pathlib import Path
 from typing import Optional, List, Dict
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from sklearn.metrics import roc_curve, auc, confusion_matrix, ConfusionMatrixDisplay
+
+
+def _select_serif_font() -> str:
+    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    return 'Times New Roman' if 'Times New Roman' in available_fonts else 'DejaVu Serif'
+
 
 # Global style settings
 plt.rcParams.update({
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman'],
+    'font.family': [_select_serif_font()],
     'font.size': 12,
     'axes.titlesize': 14,
     'axes.labelsize': 13,

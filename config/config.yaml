@@ -101,11 +101,14 @@ model:
 # 训练超参数
 # ---------------------------------------------------------------------------
 training:
-  batch_size: 8  # V10-minckpt-C005-B8A4: 提高物理batch，保持有效batch=32
-  accumulation_steps: 4  # V10-minckpt-C005-B8A4: 与batch_size=8配套，避免有效batch变成64
+  batch_size: 4  # V10-sanity基线：小样本更稳定，每batch约2+2
+  accumulation_steps: 8  # V10-sanity基线：保持有效batch=32
   max_epochs: 120
   early_stop_patience: 25
-  min_checkpoint_epoch: 25  # V10-no-adapter-lowC-minckpt：保留Fold 5修复
+  min_checkpoint_epoch: 25  # 在V10-sanity基础上加入，避开warmup前早期尖峰
+  checkpoint_selection:
+    metric: "balanced_auc"  # 按双数据集均衡分数保存best，避免只优化混合val AUC
+    gap_penalty: 0.25  # score = mean(77, ISLE) - penalty * |77 - ISLE|
 
   optimizer:
     name: "adamw"
@@ -144,8 +147,10 @@ losses:
     grl_lambda: 0.05
 
   contrastive:
-    weight: 0.005  # V10-minckpt-C005-B8A4：回到V10-sanity轻量对齐强度
+    weight: 0.005  # V10-sanity基线：轻量跨模态对齐
     temperature: 0.1
+    same_dataset_positive_weight: 0.5  # 同标签同数据集弱正样本
+    cross_dataset_positive_weight: 1.0  # 同标签跨数据集强正样本
 
   consistency:
     weight: 0.0  # V10全脑-only：不使用lesion相关一致性约束

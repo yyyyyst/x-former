@@ -255,8 +255,12 @@ def run_fold(config: dict, fold: int, device: torch.device,
     result = trainer.fit(train_loader, val_loader, fold=fold)
     val_threshold = result.get("best_val_threshold", 0.5)
     best_epoch = result.get("best_epoch", result.get("epoch", 0))
-    print(f"  Fold {fold + 1} best val AUC: {result['best_val_auc']:.4f} "
-          f"(epoch: {best_epoch}, thr: {val_threshold:.4f})")
+    print(f"  Fold {fold + 1} best val score: {result.get('best_val_score', result['best_val_auc']):.4f} "
+          f"(AUC: {result['best_val_auc']:.4f}, "
+          f"77: {result.get('best_val_auc_77sets', 0.0):.4f}, "
+          f"ISLE: {result.get('best_val_auc_isle2024', 0.0):.4f}, "
+          f"gap: {result.get('best_val_auc_gap', 0.0):.4f}, "
+          f"epoch: {best_epoch}, thr: {val_threshold:.4f})")
 
     # Test evaluation -- 77sets (use validation threshold, not test-optimized)
     ds77_test = Dataset77sets(

@@ -672,3 +672,111 @@ Pooled 级别：77sets 正/负均值 `0.7099/0.4400`，gap `0.2699`；ISLE 正/�
 - 如果 77sets/ISLE pooled AUC 回到或超过 V10-sanity 的 `0.7912/0.7846`，说明 `C=0.005 + min_checkpoint_epoch=25` 能同时保留 Fold 5 修复和轻量对齐收益。
 - 如果相比上一版只提升训练速度但 AUC 不升，说明 batch 不是主矛盾，下一步应回到 `batch_size=4, accumulation_steps=8` 或固定 B8/A4 后搜索 `contrastive=0.0075/0.01`。
 - 如果 AUC 继续低于上一版，说明更大的物理 batch 可能削弱小样本噪声正则，应回退 B4/A8，只保留 `contrastive=0.005` 做隔离实验。
+
+### V10-minckpt-C005-B8A4-noadapter 最新日志状态
+
+**日期:** 2026-06-02  
+**日志:** `logs/xformer_20260602_163748.log`  
+**状态:** 未完成/疑似中断。日志只有 Fold 1 完整结果，Fold 2 记录到 epoch 59 后结束；没有 5 折最终汇总。`results/joint/*` 仍是上一版 `V10-no-adapter-lowC-minckpt` 的完整结果，因此不能把本轮作为最终实验结果。
+
+当前已知结果：
+
+| Fold | Best Val AUC | Best Epoch | Threshold | 77sets Test AUC | ISLE Test AUC | 状态 |
+|------|-------------:|-----------:|----------:|----------------:|--------------:|------|
+| 1 | 0.8447 | 36 | 0.69 | 0.8095 | 0.6650 | 完成 |
+| 2 | 0.8137 | 38 | 未测试 | 未测试 | 未测试 | 中断于 epoch 59 |
+
+Fold 1 对比上一版完整结果 `V10-no-adapter-lowC-minckpt`：
+
+| 指标 | B4/A8, C=0.002 | B8/A4, C=0.005 | 变化 |
+|------|---------------:|---------------:|-----:|
+| Fold 1 Best Val AUC | 0.8758 | 0.8447 | -0.0311 |
+| Fold 1 77sets AUC | 0.8730 | 0.8095 | -0.0635 |
+| Fold 1 ISLE AUC | 0.7650 | 0.6650 | -0.1000 |
+
+初步判断：
+
+- 这版不能下最终结论，但 Fold 1 的负向信号很强：77sets 和 ISLE 同时下降，尤其 ISLE 下降 `0.10`。
+- `batch_size=8, accumulation_steps=4` 虽然保持有效 batch 为 32，但 `BalancedFullSampler` 的每个 batch 从 `2+2` 变为 `4+4`，每个 epoch 的 batch 数随 `bsisle=4` 变少，优化步数和小样本噪声正则都变了，不只是“更大 batch 更稳”。
+- B8 增加了 batch 内对比样本数，但也可能降低更新频率，并削弱 B4/A8 下有利的小样本随机性。Fold 1 结果提示当前项目不应直接把 B8/A4 作为主线。
+- 下一步若要隔离 `contrastive.weight=0.005` 的收益，应优先跑 `B4/A8 + C=0.005 + noadapter + min_checkpoint_epoch=25`，而不是继续 B8/A4。
+- 当前主要问题不是 lesion 数据不足；继续保持 `use_lesion=false`，全脑-only 口径更公平。
+
+### 最佳完整版本判定
+
+按第二篇目标，主指标应看两个数据集的完整 5 折 pooled AUC，而不是只看单个数据集或未完成日志。当前最佳主线仍是 `V10-sanity`。
+
+| 版本 | 77sets pooled AUC | ISLE pooled AUC | 双数据集均值 | 判断 |
+|------|------------------:|----------------:|-------------:|------|
+| V5 | 0.805 | 0.741 | 0.753 | 77sets 最强，但 ISLE 明显弱 |
+| V9 | 0.750 | 0.739 | 0.745 | 随机采样/复制后退化 |
+| V10-sanity | **0.7912** | **0.7846** | **0.7874** | 两队列最均衡、pooled 综合最好 |
+| V10-minckpt-C005-B4A8-noadapter | 0.7538 | **0.7987** | 0.7763 | ISLE 最高，但 77sets 明显回落 |
+| V10-adapter-min-ckpt | 0.7544 | 0.7451 | 0.7498 | adapter 伤害排序 |
+| V10-no-adapter-lowC-minckpt | 0.7714 | 0.7554 | 0.7635 | min checkpoint 有效，但 C=0.002 伤害 ISLE |
+| V10-B8A4-C005 | 未完成 | 未完成 | 不计入 | Fold 1 已有负向信号 |
+
+最新完成的 B4/A8 + C=0.005 + min checkpoint 证明 `min_checkpoint_epoch=25` 和轻量对齐对 ISLE 有收益，但 77sets pooled AUC 下跌较大，双数据集均值仍未超过 `V10-sanity`。因此下一步不应回到 adapter、lesion 或 B8/A4；优先解决 checkpoint 选择对队列不均衡的偏置。
+
+### V10-minckpt-C005-B4A8-noadapter 下一版配置
+
+**状态:** 已写入 `config/config.yaml`，建议作为下一次正式 5 折运行。  
+**目标:** 以 `V10-sanity` 为基线，只加入 `min_checkpoint_epoch=25`，避免 Fold 5 保存 warmup 前尖峰；同时避开 B8/A4 对 `BalancedFullSampler` batch 构成和每 epoch step 数的额外扰动。
+
+| 参数 | B8/A4 中断版 | 下一版 | 原因 |
+|------|-------------:|-------:|------|
+| `training.batch_size` | 8 | **4** | 回到每 batch `2+2`，保留小样本梯度噪声正则 |
+| `training.accumulation_steps` | 4 | **8** | 有效 batch 仍为 32，避免优化尺度变化 |
+| `losses.contrastive.weight` | 0.005 | **0.005** | 隔离测试 C=0.005，不再和 batch 改动混在一起 |
+| `classifier.adapter.enabled` | false | **false** | adapter 已证实降低 pooled AUC |
+| `training.min_checkpoint_epoch` | 25 | **25** | 保留 Fold 5 早期尖峰修复 |
+| `sampling.strategy` | balanced_full | **balanced_full** | 保持 ISLE 全量参与、77sets replacement 补齐 |
+| `ablation.use_lesion` | false | **false** | 继续全脑-only，与第一篇公平对比 |
+
+预期结果：
+
+- 保守预期：回到或略高于 `V10-no-adapter-lowC-minckpt`，即 77sets pooled AUC `0.77-0.80`，ISLE pooled AUC `0.76-0.79`。
+- 理想预期：接近或超过 `V10-sanity` 的 `0.7912/0.7846`，同时 Fold 5 不再塌到 `0.60`。
+- 若该版仍不能提升 ISLE，优先改 checkpoint 选择指标为 dataset-balanced score，而不是继续增大 batch。
+
+### V10-minckpt-C005-B4A8-noadapter 实际结果
+
+**日期:** 2026-06-03  
+**日志:** `logs/xformer_20260602_225931.log`  
+**状态:** 完成 5 折。  
+**核心配置:** `balanced_full`，`batch_size=4`，`accumulation_steps=8`，`use_lesion=false`，`classifier.adapter.enabled=false`，`min_checkpoint_epoch=25`，`domain.weight=0.01`，`contrastive.weight=0.005`。
+
+每折结果：
+
+| Fold | Best Val AUC | Best Epoch | Threshold | 77sets Test AUC | ISLE Test AUC | Gap |
+|------|-------------:|-----------:|----------:|----------------:|--------------:|----:|
+| 1 | 0.8385 | 39 | 0.59 | 0.8413 | 0.7850 | 0.0563 |
+| 2 | 0.8043 | 49 | 0.43 | 0.7302 | 0.9200 | 0.1898 |
+| 3 | 0.8758 | 45 | 0.71 | 0.8750 | 0.8950 | 0.0200 |
+| 4 | 0.8540 | 44 | 0.58 | 0.8214 | 0.6850 | 0.1364 |
+| 5 | 0.9099 | 63 | 0.81 | 0.6429 | 0.7158 | 0.0729 |
+
+最终汇总：
+
+| 指标 | 77sets | ISLE2024 |
+|------|-------:|---------:|
+| 5-fold mean AUC | 0.7821 ± 0.0846 | 0.8002 ± 0.0938 |
+| Pooled AUC | 0.7538 (95% CI: 0.6356-0.8638) | 0.7987 (95% CI: 0.7213-0.8737) |
+| Pooled accuracy | 0.6871 | 0.7393 |
+| Pooled F1 macro | 0.6829 | 0.7098 |
+| Mean modality gap | 0.0951 ± 0.0605 | - |
+
+与关键版本对比：
+
+| 版本 | 77sets pooled AUC | ISLE pooled AUC | 双数据集均值 | 结论 |
+|------|------------------:|----------------:|-------------:|------|
+| V10-sanity | 0.7912 | 0.7846 | 0.7874 | 仍是最佳综合主线 |
+| V10-no-adapter-lowC-minckpt | 0.7714 | 0.7554 | 0.7635 | 低 C 伤害 ISLE |
+| V10-minckpt-C005-B4A8-noadapter | 0.7538 | 0.7987 | 0.7763 | ISLE 提升，但 77sets 回落 |
+
+问题分析：
+
+- 这版没有超过 `V10-sanity`。ISLE pooled AUC 从 `0.7846` 提到 `0.7987`，但 77sets 从 `0.7912` 掉到 `0.7538`，双数据集均值下降 `0.0111`。
+- `min_checkpoint_epoch=25` 有效：5 个 fold 的 best epoch 都晚于 25，Fold 5 从 V10-sanity 的早期 epoch 14 推迟到 epoch 63，ISLE Fold 5 从 `0.6000` 提到 `0.7158`。
+- 主要问题是 checkpoint 选择仍不够 dataset-balanced。Fold 2 偏向 ISLE（`0.9200` vs `0.7302`），Fold 4 偏向 77sets（`0.8214` vs `0.6850`），平均 modality gap `0.0951`，高于目标 `<0.08`。
+- Fold 5 的 validation AUC 很高（`0.9099`），但 77sets test AUC 只有 `0.6429`，说明当前 val AUC 对 77sets 外部排序不够可靠。下一步应优先保存 top-k checkpoints，并用 dataset-balanced score（例如 `mean_auc - gap_penalty` 或 `min(auc_77, auc_isle)`）做模型选择，而不是继续改 batch、重开 adapter 或引入 lesion。
